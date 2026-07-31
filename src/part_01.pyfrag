@@ -1,0 +1,99 @@
+# MAT-Appendix primary study: run once per 5 OOF folds, then reuse the saved PKL.
+import os,sys,subprocess,json,random,hashlib,shutil,tempfile,getpass,platform,warnings
+from pathlib import Path
+from datetime import datetime,timezone
+subprocess.check_call([sys.executable,'-m','pip','install','-q','ucimlrepo','joblib','shap','lime','openpyxl'])
+import numpy as np,pandas as pd,joblib,matplotlib.pyplot as plt,torch,torch.nn as nn
+from torch.utils.data import TensorDataset,DataLoader
+from sklearn.model_selection import StratifiedKFold,StratifiedShuffleSplit
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import *
+from sklearn.calibration import calibration_curve
+from ucimlrepo import fetch_ucirepo
+from IPython.display import display
+warnings.filterwarnings('ignore')
+
+C=dict(seed=2026,folds=5,epochs=120,patience=16,batch=64,d=48,heads=4,layers=2,ff=128,drop=.25,lr=8e-4,wd=1e-4,corrupt=.05,boot=1000,bins=10,perm=3,repo='AzizulHakim00/MAT-Appendix',branch='main')
+S=C['seed']; random.seed(S); np.random.seed(S); torch.manual_seed(S)
+if torch.cuda.is_available(): torch.cuda.manual_seed_all(S)
+torch.backends.cudnn.deterministic=True; torch.backends.cudnn.benchmark=False; torch.use_deterministic_algorithms(True,warn_only=True)
+DEV=torch.device('cuda' if torch.cuda.is_available() else 'cpu'); RID=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+try:
+ from google.colab import drive
+ drive.mount('/content/drive',force_remount=False); ROOT=Path('/content/drive/MyDrive/MAT-Appendix')
+except Exception as e:
+ print('Drive unavailable; using /content:',e); ROOT=Path('/content/MAT-Appendix')
+OUT=ROOT/'runs'/RID
+for p in [OUT,OUT/'tables',OUT/'figures',OUT/'models']: p.mkdir(parents=True,exist_ok=True)
+print('Device:',DEV,'Run:',RID,'Output:',OUT)
+
+# Direct URL-backed UCI fetch; no local upload.
+d=fetch_ucirepo(id=938); X0=d.data.features.copy(); Y0=d.data.targets.copy()
+clean=lambda x:str(x).strip().replace(' ','_').replace('-','_').replace('/','_')
+X0.columns=[clean(x) for x in X0]; Y0.columns=[clean(x) for x in Y0]
+t=[c for c in Y0 if c.lower()=='severity'][0]; lab=Y0[t].astype(str).str.lower()
+mask=lab.str.contains('uncomplicated',na=False)|(lab.str.contains('complicated',na=False)&~lab.str.contains('uncomplicated',na=False))
+X=X0.loc[mask].reset_index(drop=True); lab=lab.loc[mask].reset_index(drop=True); y=(~lab.str.contains('uncomplicated')).astype(int).to_numpy(); row_ids=X0.index[mask].astype(str).tolist()
+block_exact={'Length_of_Stay','Management','Severity','Diagnosis','Diagnosis_Presumptive','Patient_ID','ID','Outcome','Discharge_Status'}
+patterns={'post_decision':['severity','diagnos','management','length_of_stay','discharge','outcome'],'procedure_pathology':['surg','operat','histopath','patholog','appendectomy'],'direct_target_definition':['perfor','abscess','gangren','complic','periton']}
+def reason(c):
+ if c in block_exact or c.lower() in {'id','patientid','patient_id'}: return 'identifier/target/post-decision'
+ for k,v in patterns.items():
+  if any(z in c.lower() for z in v): return k
+ return ''
+audit=[]; keep=[]
+for c in X:
+ r=reason(c); audit.append([c,'DROP' if r else 'KEEP',r or 'admission-time candidate']); keep+=[] if r else [c]
+X=X[keep].copy()
+for c in X.select_dtypes(include=['object','string']): X[c]=X[c].replace(r'^\s*(?:\?|na|n/a|nan|none|null|unknown|not available)\s*$',np.nan,regex=True)
+const=[c for c in X if X[c].nunique(dropna=True)<=1]
+for c in const: audit.append([c,'DROP','constant/empty'])
+X=X.drop(columns=const); audit=pd.DataFrame(audit,columns=['feature','action','reason']).drop_duplicates('feature',keep='last')
+if len(np.unique(y))!=2 or len(y)<100: raise ValueError('Unexpected severity cohort/schema.')
+hash_df=X.astype('string').fillna('<NA>'); hash_df['target']=y.astype(str); data_hash=hashlib.sha256(pd.util.hash_pandas_object(hash_df,index=True).values.tobytes()).hexdigest()
+cohort=pd.DataFrame({'item':['rows','complicated','uncomplicated','prevalence','features','sha256'],'value':[len(y),y.sum(),len(y)-y.sum(),y.mean(),X.shape[1],data_hash]})
+display(cohort); display(audit.query("action=='DROP'"))
+
+def numeric(s):
+ if pd.api.types.is_numeric_dtype(s): return True
+ z=pd.to_numeric(s,errors='coerce'); return s.notna().sum()>0 and z.notna().sum()/s.notna().sum()>=.95
+def fitprep(df):
+ p={'cols':list(df),'types':[],'num':{},'cat':{},'cards':[]}
+ for c in p['cols']:
+  s=df[c]
+  if numeric(s):
+   z=pd.to_numeric(s,errors='coerce').astype(float); med=float(z.median()) if z.notna().any() else 0.; q=z.fillna(med); mu=float(q.mean()); sd=float(q.std(ddof=0)); sd=sd if np.isfinite(sd) and sd>1e-8 else 1.
+   p['types'].append('n');p['num'][c]=(med,mu,sd);p['cards'].append(0)
+  else:
+   vals=sorted(s.dropna().astype(str).str.strip().unique()); mp={v:i+1 for i,v in enumerate(vals)}
+   p['types'].append('c');p['cat'][c]=mp;p['cards'].append(len(mp)+1)
+ return p
+def trans(df,p):
+ v=np.zeros((len(df),len(p['cols'])),np.float32);m=np.zeros_like(v,np.int64)
+ for j,c in enumerate(p['cols']):
+  s=df[c] if c in df else pd.Series(np.nan,index=df.index);m[:,j]=s.isna().to_numpy()
+  if p['types'][j]=='n':
+   med,mu,sd=p['num'][c];z=pd.to_numeric(s,errors='coerce').astype(float);m[:,j]=z.isna();v[:,j]=((z.fillna(med)-mu)/sd).to_numpy(np.float32)
+  else:v[:,j]=s.astype('string').str.strip().map(p['cat'][c]).fillna(0).astype(int)
+ return v,m
+
+class MAT(nn.Module):
+ def __init__(self,p):
+  super().__init__();self.p=p;D=C['d'];self.vm=nn.ModuleList([nn.Linear(1,D) if t=='n' else nn.Embedding(max(2,k),D) for t,k in zip(p['types'],p['cards'])]);self.fe=nn.Embedding(len(p['cols']),D);self.me=nn.Embedding(2,D);self.cls=nn.Parameter(torch.zeros(1,1,D))
+  l=nn.TransformerEncoderLayer(D,C['heads'],C['ff'],C['drop'],activation='gelu',batch_first=True,norm_first=True);self.enc=nn.TransformerEncoder(l,C['layers']);self.norm=nn.LayerNorm(D);self.head=nn.Sequential(nn.Linear(D,D//2),nn.GELU(),nn.Dropout(C['drop']),nn.Linear(D//2,1));nn.init.normal_(self.cls,std=.02)
+ def forward(self,v,m):
+  if self.training and C['corrupt']:
+   q=torch.rand_like(v)<C['corrupt'];v=v.clone();m=m.clone();v[q]=0;m[q]=1
+  z=[]
+  for j,t in enumerate(self.p['types']):
+   a=self.vm[j](v[:,j:j+1]) if t=='n' else self.vm[j](v[:,j].round().long().clamp(0,self.p['cards'][j]-1))
+   z.append(a+self.fe.weight[j][None,:]+self.me(m[:,j].long().clamp(0,1)))
+  z=torch.stack(z,1);h=self.enc(torch.cat([self.cls.expand(len(v),-1,-1),z],1))[:,0]
+  return self.head(self.norm(h)).squeeze(1)
+class Focal(nn.Module):
+ def __init__(self,a):super().__init__();self.a=a
+ def forward(self,z,y):
+  b=nn.functional.binary_cross_entropy_with_logits(z,y,reduction='none');p=torch.sigmoid(z);pt=torch.where(y==1,p,1-p);a=torch.where(y==1,torch.full_like(y,self.a),torch.full_like(y,1-self.a));return(a*(1-pt).pow(2)*b).mean()
+def pred(model,v,m):
+ model.eval();out=[]
+ with torch.no_grad():
