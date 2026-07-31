@@ -1,0 +1,26 @@
+# Additional complete metric and probability-error figures.
+core_metrics = ['Accuracy', 'Balanced_Accuracy', 'Precision_PPV', 'Recall_Sensitivity_TPR', 'Specificity_TNR', 'NPV', 'F1', 'MCC']
+fig, ax = plt.subplots(figsize=(12, 6))
+x = np.arange(len(metrics_primary))
+width = 0.10
+for metric_index, metric in enumerate(core_metrics):
+    ax.bar(x + (metric_index - (len(core_metrics)-1)/2)*width, metrics_primary[metric], width, label=metric)
+ax.set_xticks(x)
+ax.set_xticklabels(metrics_primary['Model'], rotation=35, ha='right')
+ax.set_ylim(-0.1, 1.0)
+ax.set_ylabel('Metric value')
+ax.set_title('Complete threshold-dependent metric comparison')
+ax.legend(fontsize=7, ncol=4)
+save_figure(fig, '06b_core_metric_comparison')
+
+fig, ax = plt.subplots(figsize=(10, 5))
+x = np.arange(len(metrics_primary)); width = 0.28
+ax.bar(x-width, metrics_primary['Brier'], width, label='Brier')
+ax.bar(x, metrics_primary['Log_Loss'], width, label='Log loss')
+ax.bar(x+width, metrics_primary['ECE'], width, label='ECE')
+ax.set_xticks(x)
+ax.set_xticklabels(metrics_primary['Model'], rotation=35, ha='right')
+ax.set_title('Probability error and calibration loss')
+ax.legend()
+save_figure(fig, '07b_probability_error_metrics')
+
