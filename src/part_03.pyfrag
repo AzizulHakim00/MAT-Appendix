@@ -1,0 +1,44 @@
+def save(fig,name):fig.savefig(OUT/'figures'/(name+'.png'),dpi=300,bbox_inches='tight');fig.savefig(OUT/'figures'/(name+'.pdf'),bbox_inches='tight');plt.show();plt.close(fig)
+miss=pd.DataFrame({'feature':X.columns,'missing_fraction':X.isna().mean()}).sort_values('missing_fraction',ascending=False);fig,ax=plt.subplots(figsize=(9,6));q=miss.head(20).sort_values('missing_fraction');ax.barh(q.feature,q.missing_fraction);ax.set_title('Top missing variables');save(fig,'01_missingness')
+fpr,tpr,_=roc_curve(y,cal);fig,ax=plt.subplots();ax.plot(fpr,tpr,label=f'AUC={roc_auc_score(y,cal):.3f}');ax.plot([0,1],[0,1],'--');ax.legend();ax.set_title('5-fold OOF ROC');save(fig,'02_roc')
+P,R,_=precision_recall_curve(y,cal);fig,ax=plt.subplots();ax.plot(R,P,label=f'AP={average_precision_score(y,cal):.3f}');ax.axhline(y.mean(),ls='--');ax.legend();ax.set_title('5-fold OOF PR');save(fig,'03_pr')
+fig,ax=plt.subplots();
+for n,pb in [('raw',oof),('calibrated',cal)]:a,b=calibration_curve(y,pb,n_bins=10,strategy='quantile');ax.plot(b,a,'o-',label=n)
+ax.plot([0,1],[0,1],'--');ax.legend();ax.set_title('Calibration');save(fig,'04_calibration')
+cm=confusion_matrix(y,cls);fig,ax=plt.subplots();im=ax.imshow(cm);[ax.text(j,i,cm[i,j],ha='center',va='center') for i in range(2) for j in range(2)];fig.colorbar(im,ax=ax);ax.set_title('OOF confusion matrix');save(fig,'05_confusion')
+fig,ax=plt.subplots(figsize=(9,6));q=perm.head(20).sort_values('mean');ax.barh(q.feature,q['mean'],xerr=q['std'].fillna(0));ax.set_title('OOF permutation importance');save(fig,'06_permutation')
+if xstatus.get('SHAP')=='completed':
+ import shap
+ shap.summary_plot(shapdata['shap'],shapdata['values'],feature_names=names,plot_type='bar',max_display=20,show=False);save(plt.gcf(),'07_shap_bar')
+ shap.summary_plot(shapdata['shap'],shapdata['values'],feature_names=names,max_display=20,show=False);save(plt.gcf(),'08_shap_beeswarm')
+if xstatus.get('LIME')=='completed':
+ q=pd.DataFrame(limedata['items'],columns=['rule','weight']).sort_values('weight');fig,ax=plt.subplots(figsize=(9,6));ax.barh(q.rule,q.weight);ax.set_title('LIME local explanation');save(fig,'09_lime')
+
+# Tables, predictions, and reusable bundle.
+cohort.to_csv(OUT/'tables'/'cohort.csv',index=False);audit.to_csv(OUT/'tables'/'leakage_audit.csv',index=False);miss.to_csv(OUT/'tables'/'missingness.csv',index=False);folds.to_csv(OUT/'tables'/'fold_metrics.csv',index=False);summary.to_csv(OUT/'tables'/'summary_metrics.csv',index=False);ci.to_csv(OUT/'tables'/'bootstrap_ci.csv',index=False);calbins.to_csv(OUT/'tables'/'calibration_bins.csv',index=False);perm.to_csv(OUT/'tables'/'permutation.csv',index=False)
+preds=pd.DataFrame({'row':range(len(y)),'source_row':row_ids,'truth':y,'raw_oof':oof,'calibrated_oof':cal,'crossfit_threshold':ths,'prediction':cls});preds.to_csv(OUT/'tables'/'oof_predictions.csv',index=False)
+vers={'python':platform.python_version(),'numpy':np.__version__,'pandas':pd.__version__,'torch':torch.__version__,'sklearn':__import__('sklearn').__version__,'device':str(DEV)}
+bundle={'version':'1.0','run_id':RID,'config':C,'dataset':{'uci_id':938,'sha256':data_hash,'row_ids':row_ids,'features':list(X),'mapping':{'uncomplicated':0,'complicated':1}},'audit':audit.to_dict('records'),'folds':arts,'oof':{'y':y.astype(np.int8),'raw':oof.astype(np.float32),'calibrated':cal.astype(np.float32),'thresholds':ths.astype(np.float32),'classes':cls.astype(np.int8)},'calibration':{'crossfit_models':cals,'final':final_cal,'deployment_threshold':deploy_threshold},'metrics':{'folds':folds.to_dict('records'),'summary':summary.to_dict('records'),'ci':ci.to_dict('records')},'xai':{'status':xstatus,'permutation':perm.to_dict('records'),'shap':shapdata,'lime':limedata},'versions':vers}
+joblib.dump(bundle,OUT/'mat_appendix_reproducibility.pkl',compress=3)
+json.dump({'run_id':RID,'results':summary.to_dict('records'),'ci':ci.to_dict('records'),'xai':xstatus},open(OUT/'paper_results.json','w'),indent=2);json.dump(vers,open(OUT/'software_versions.json','w'),indent=2)
+(OUT/'MODEL_CARD.md').write_text(f'# MAT-Appendix\n\nRun `{RID}`; five OOF fits; UCI 938; severity target; dataset SHA-256 `{data_hash}`. Preprocessing is outer-fold-only. Calibration, bootstrap, SHAP, LIME and permutation analyses do not retrain MAT-Appendix.\n')
+manifest={}
+for f in OUT.rglob('*'):
+ if f.is_file():manifest[str(f.relative_to(OUT))]={'bytes':f.stat().st_size,'sha256':hashlib.sha256(f.read_bytes()).hexdigest()}
+json.dump({'run_id':RID,'files':manifest},open(OUT/'manifest.json','w'),indent=2)
+z=shutil.make_archive(str(OUT.parent/f'MAT_Appendix_Paper_Assets_{RID}'),'zip',root_dir=OUT);shutil.move(z,OUT/Path(z).name)
+display(folds);display(summary);display(ci);display(pd.DataFrame([xstatus]));print('Bundle:',OUT/'mat_appendix_reproducibility.pkl')
+
+# Optional secure result push. Add GITHUB_TOKEN to Colab Secrets with Contents: read/write.
+def token():
+ try:
+  from google.colab import userdata
+  return (userdata.get('GITHUB_TOKEN') or '').strip()
+ except:return os.environ.get('GITHUB_TOKEN','').strip()
+def push():
+ tok=token()
+ if not tok:return {'status':'skipped','reason':'GITHUB_TOKEN missing'}
+ w=Path(tempfile.mkdtemp());r=w/'repo';env=os.environ.copy();env['GITHUB_TOKEN']=tok;a=w/'ask.sh';a.write_text('#!/bin/sh\ncase "$1" in *Username*) echo x-access-token;; *Password*) echo "$GITHUB_TOKEN";; esac\n');a.chmod(0o700);env['GIT_ASKPASS']=str(a);env['GIT_TERMINAL_PROMPT']='0';subprocess.check_call(['git','clone','--depth','1','--branch',C['branch'],f"https://github.com/{C['repo']}.git",str(r)],env=env);dest=r/'results'/'runs'/RID;shutil.copytree(OUT,dest,dirs_exist_ok=True);(r/'results'/'LATEST_RUN.txt').write_text(RID+'\n');subprocess.check_call(['git','-C',str(r),'config','user.name','MAT-Appendix Colab']);subprocess.check_call(['git','-C',str(r),'config','user.email','actions@users.noreply.github.com']);subprocess.check_call(['git','-C',str(r),'add','results']);subprocess.check_call(['git','-C',str(r),'commit','-m',f'Add MAT-Appendix run {RID}']);subprocess.check_call(['git','-C',str(r),'push','origin',C['branch']],env=env);sha=subprocess.check_output(['git','-C',str(r),'rev-parse','HEAD'],text=True).strip();shutil.rmtree(w,ignore_errors=True);return {'status':'pushed','commit':sha,'run_id':RID}
+try:status=push()
+except Exception as e:status={'status':'failed','reason':str(e)}
+json.dump(status,open(OUT/'github_push_status.json','w'),indent=2);print('GitHub:',status);print('DONE: proposed model trained exactly 5 times.')
