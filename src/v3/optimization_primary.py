@@ -20,4 +20,36 @@ if actual_sha256 != _EXPECTED_SHA256:
     raise RuntimeError(
         f'Optimization source checksum mismatch: expected {_EXPECTED_SHA256}, got {actual_sha256}'
     )
+
+# Runtime hotfix (2026-08-01): NumPy coerces mixed string/float choices to strings.
+# This made RandomForest/ExtraTrees receive np.str_('0.55') instead of float 0.55.
+def _apply_parameter_type_hotfix(text):
+    anchor = 'def sample_candidates(name, rng, class_ratio):'
+    helper = '''def _typed_choice(rng, options):
+    """Return an original Python object without NumPy mixed-dtype coercion."""
+    return options[int(rng.integers(0, len(options)))]
+
+
+'''
+    if 'def _typed_choice(rng, options):' not in text:
+        if text.count(anchor) != 1:
+            raise RuntimeError('Optimization hotfix failed: sample_candidates anchor mismatch.')
+        text = text.replace(anchor, helper + anchor, 1)
+
+    replacements = {
+        "rng.choice([None,4,6,8,10])": "_typed_choice(rng, [None,4,6,8,10])",
+        "rng.choice(['sqrt',0.35,0.55,0.75])": "_typed_choice(rng, ['sqrt',0.35,0.55,0.75])",
+        "rng.choice([None,5,8,12])": "_typed_choice(rng, [None,5,8,12])",
+        "rng.choice(['sqrt',0.4,0.6,0.8])": "_typed_choice(rng, ['sqrt',0.4,0.6,0.8])",
+        "class_weight=rng.choice(['balanced','balanced_subsample'])": "class_weight=_typed_choice(rng, ['balanced','balanced_subsample'])",
+    }
+    for old, new in replacements.items():
+        if old not in text:
+            raise RuntimeError(f'Optimization hotfix target missing: {old}')
+        text = text.replace(old, new)
+    return text
+
+source = _apply_parameter_type_hotfix(source)
+compile(source, 'MAT_Appendix_Optimization_Primary_FullSource.py', 'exec')
+print('Applied RandomForest/ExtraTrees parameter-type hotfix.')
 exec(compile(source, 'MAT_Appendix_Optimization_Primary_FullSource.py', 'exec'))
