@@ -1,0 +1,4 @@
+paper_results = {
+    'run_id': RUN_ID,
+    'cohort': cohort.to_dict('records'),
+    'primary_metrics': metrics_primary.to_dict('records'),
