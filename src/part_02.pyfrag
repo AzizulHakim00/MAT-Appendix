@@ -1,0 +1,74 @@
+  for a,b in DataLoader(TensorDataset(torch.tensor(v),torch.tensor(m)),256):out.append(torch.sigmoid(model(a.to(DEV),b.to(DEV))).cpu().numpy())
+ return np.concatenate(out)
+def fitfold(tr,te,k):
+ xt=X.iloc[tr].reset_index(drop=True);yt=y[tr];xv=X.iloc[te].reset_index(drop=True);p=fitprep(xt);V,M=trans(xt,p);VV,MM=trans(xv,p);a,b=next(StratifiedShuffleSplit(1,test_size=.16,random_state=S+k).split(V,yt));g=torch.Generator().manual_seed(S+k);dl=DataLoader(TensorDataset(torch.tensor(V[a]),torch.tensor(M[a]),torch.tensor(yt[a],dtype=torch.float32)),C['batch'],shuffle=True,generator=g)
+ model=MAT(p).to(DEV);pos=max(yt[a].sum(),1);lossfn=Focal((len(a)-pos)/len(a));opt=torch.optim.AdamW(model.parameters(),lr=C['lr'],weight_decay=C['wd']);best=-1;state=None;stale=0;hist=[]
+ for e in range(1,C['epochs']+1):
+  model.train();ls=[]
+  for q,r,s in dl:
+   opt.zero_grad();loss=lossfn(model(q.to(DEV),r.to(DEV)),s.to(DEV));loss.backward();nn.utils.clip_grad_norm_(model.parameters(),1);opt.step();ls.append(loss.item())
+  pp=pred(model,V[b],M[b]);sc=average_precision_score(yt[b],pp);hist.append((e,np.mean(ls),sc))
+  if sc>best+1e-5:best=sc;state={n:z.detach().cpu().clone() for n,z in model.state_dict().items()};stale=0
+  else:stale+=1
+  if stale>=C['patience']:break
+ model.load_state_dict(state);model.to(DEV);oo=pred(model,VV,MM);fm={'fold':k,'train_n':len(tr),'test_n':len(te),'best_epoch':max(hist,key=lambda z:z[2])[0],'inner_pr':best,'roc_auc':roc_auc_score(y[te],oo),'pr_auc':average_precision_score(y[te],oo),'brier':brier_score_loss(y[te],oo)}
+ return {'fold':k,'train_idx':tr.tolist(),'test_idx':te.tolist(),'prep':p,'state':state,'history':hist,'pred':oo.astype(np.float32)},fm
+
+oof=np.full(len(y),np.nan);arts=[];fms=[]
+for k,(tr,te) in enumerate(StratifiedKFold(C['folds'],shuffle=True,random_state=S).split(X,y),1):
+ print(f'Training MAT-Appendix fold {k}/5');a,f=fitfold(tr,te,k);arts.append(a);fms.append(f);oof[te]=a['pred'];torch.save(a['state'],OUT/'models'/f'fold_{k}.pt');print(f)
+assert np.isfinite(oof).all();folds=pd.DataFrame(fms)
+
+def logit(p):p=np.clip(p,1e-6,1-1e-6);return np.log(p/(1-p)).reshape(-1,1)
+def ece(y,p,n=10):
+ edges=np.linspace(0,1,n+1);E=M=0;rows=[]
+ for i in range(n):
+  q=(p>=edges[i])&(p<(edges[i+1]) if i<n-1 else p<=edges[i+1])
+  if q.sum():a=y[q].mean();c=p[q].mean();g=abs(a-c);E+=q.mean()*g;M=max(M,g);rows.append([i+1,q.sum(),c,a,g])
+ return E,M,pd.DataFrame(rows,columns=['bin','n','mean_probability','observed_rate','gap'])
+def threshold(y,p):
+ q=np.unique(np.quantile(p,np.linspace(.02,.98,197)));return float(q[np.argmax([balanced_accuracy_score(y,p>=z) for z in q])])
+cal=np.full(len(y),np.nan);cls=np.zeros(len(y),int);ths=np.full(len(y),np.nan);cals=[]
+for k,(tr,te) in enumerate(StratifiedKFold(5,shuffle=True,random_state=S+97).split(oof[:,None],y)):
+ m=LogisticRegression(C=1e6).fit(logit(oof[tr]),y[tr]);cal[te]=m.predict_proba(logit(oof[te]))[:,1];tp=m.predict_proba(logit(oof[tr]))[:,1];z=threshold(y[tr],tp);ths[te]=z;cls[te]=cal[te]>=z;cals.append(m)
+final_cal=LogisticRegression(C=1e6).fit(logit(oof),y);deploy_threshold=threshold(y,final_cal.predict_proba(logit(oof))[:,1])
+def metrics(name,p,b):
+ E,M,_=ece(y,p,C['bins']);return dict(prediction=name,ROC_AUC=roc_auc_score(y,p),PR_AUC=average_precision_score(y,p),Balanced_Accuracy=balanced_accuracy_score(y,b),Precision=precision_score(y,b,zero_division=0),Recall=recall_score(y,b),F1=f1_score(y,b),Brier=brier_score_loss(y,p),Log_Loss=log_loss(y,p),ECE=E,MCE=M)
+summary=pd.DataFrame([metrics('Raw OOF',oof,oof>=.5),metrics('Cross-fitted calibrated OOF',cal,cls)])
+
+def bootci():
+ rng=np.random.default_rng(S+123);z=[]
+ for _ in range(C['boot']):
+  i=rng.integers(0,len(y),len(y))
+  if len(np.unique(y[i]))<2:continue
+  z.append([roc_auc_score(y[i],cal[i]),average_precision_score(y[i],cal[i]),brier_score_loss(y[i],cal[i]),ece(y[i],cal[i],C['bins'])[0]])
+ z=np.array(z);est=[roc_auc_score(y,cal),average_precision_score(y,cal),brier_score_loss(y,cal),ece(y,cal,C['bins'])[0]]
+ return pd.DataFrame({'metric':['ROC_AUC','PR_AUC','Brier','ECE'],'estimate':est,'CI_2.5%':np.quantile(z,.025,0),'CI_97.5%':np.quantile(z,.975,0)})
+ci=bootci();_,_,calbins=ece(y,cal,C['bins'])
+
+def restore(a):m=MAT(a['prep']);m.load_state_dict(a['state']);return m.to(DEV).eval()
+rng=np.random.default_rng(S+222);pr=[]
+for a in arts:
+ m=restore(a);te=np.array(a['test_idx']);xt=X.iloc[te].reset_index(drop=True);V,M=trans(xt,a['prep']);base=average_precision_score(y[te],pred(m,V,M))
+ for c in X:
+  dd=[]
+  for _ in range(C['perm']):q=xt.copy();q[c]=rng.permutation(q[c]);v,z=trans(q,a['prep']);dd.append(base-average_precision_score(y[te],pred(m,v,z)))
+  pr.append([a['fold'],c,np.mean(dd)])
+prraw=pd.DataFrame(pr,columns=['fold','feature','pr_auc_drop']);perm=prraw.groupby('feature').pr_auc_drop.agg(['mean','std']).reset_index().sort_values('mean',ascending=False)
+
+# SHAP/LIME on median-performance fold, using saved model only.
+xstatus={};shapdata={};limedata={};rep=arts[int((folds.pr_auc-folds.pr_auc.median()).abs().idxmin())];model=restore(rep);p=rep['prep'];tr=X.iloc[rep['train_idx']].reset_index(drop=True);te=X.iloc[rep['test_idx']].reset_index(drop=True);V,M=trans(tr,p);VV,MM=trans(te,p);D=VV.shape[1];ZT=np.c_[V,M];ZE=np.c_[VV,MM];names=[c+'__value' for c in X]+[c+'__missing' for c in X]
+def black(z):
+ z=np.asarray(z,np.float32);v=z[:,:D].copy();m=np.rint(z[:,D:]).clip(0,1).astype(int)
+ for j,t in enumerate(p['types']):
+  if t=='c':v[:,j]=np.rint(v[:,j]).clip(0,p['cards'][j]-1)
+ return pred(model,v,m)
+try:
+ import shap
+ rr=np.random.default_rng(S+333);bg=ZT[rr.choice(len(ZT),min(20,len(ZT)),False)];ix=rr.choice(len(ZE),min(30,len(ZE)),False);ex=ZE[ix];E=shap.KernelExplainer(black,bg);sv=E.shap_values(ex,nsamples=120);sv=np.asarray(sv[-1] if isinstance(sv,list) else sv);shapdata={'fold':rep['fold'],'names':names,'values':ex.astype(np.float32),'shap':sv.astype(np.float32),'expected':float(np.asarray(E.expected_value).reshape(-1)[-1])};xstatus['SHAP']='completed'
+except Exception as e:xstatus['SHAP']='failed: '+str(e)
+try:
+ from lime.lime_tabular import LimeTabularExplainer
+ cats=[j for j,t in enumerate(p['types']) if t=='c']+list(range(D,2*D));L=LimeTabularExplainer(ZT,feature_names=names,class_names=['uncomplicated','complicated'],categorical_features=cats,mode='classification',random_state=S);yy=y[np.array(rep['test_idx'])];cand=np.where(yy==1)[0];cand=cand if len(cand) else np.arange(len(yy));i=int(cand[np.argmax(black(ZE[cand]))]);ex=L.explain_instance(ZE[i],lambda z:np.c_[1-black(z),black(z)],num_features=min(15,2*D),labels=(1,));limedata={'fold':rep['fold'],'row':int(rep['test_idx'][i]),'truth':int(yy[i]),'probability':float(black(ZE[[i]])[0]),'items':ex.as_list(label=1)};ex.save_to_file(str(OUT/'figures'/'lime.html'));xstatus['LIME']='completed'
+except Exception as e:xstatus['LIME']='failed: '+str(e)
+
