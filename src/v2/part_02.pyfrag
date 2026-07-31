@@ -1,0 +1,179 @@
+            mapping = {value: index + 1 for index, value in enumerate(values)}
+            prep['types'].append('categorical')
+            prep['categorical'][column] = mapping
+            prep['cardinalities'].append(len(mapping) + 1)
+    return prep
+
+
+def transform_frame(df, prep):
+    values = np.zeros((len(df), len(prep['columns'])), dtype=np.float32)
+    missing = np.zeros_like(values, dtype=np.int64)
+    for j, column in enumerate(prep['columns']):
+        series = df[column] if column in df.columns else pd.Series(np.nan, index=df.index)
+        if prep['types'][j] == 'numeric':
+            median, mean, std = prep['numeric'][column]
+            numeric = pd.to_numeric(series, errors='coerce').astype(float)
+            missing[:, j] = numeric.isna().to_numpy(dtype=np.int64)
+            values[:, j] = ((numeric.fillna(median) - mean) / std).to_numpy(dtype=np.float32)
+        else:
+            missing[:, j] = series.isna().to_numpy(dtype=np.int64)
+            values[:, j] = (
+                series.astype('string').str.strip()
+                .map(prep['categorical'][column])
+                .fillna(0).astype(int).to_numpy(dtype=np.float32)
+            )
+    return values, missing
+
+
+def matrix_for_classical(values, missing):
+    return np.concatenate([values, missing.astype(np.float32)], axis=1)
+
+# -----------------------------------------------------------------------------
+# 3. MAT/FT models
+# -----------------------------------------------------------------------------
+class FeatureTokenTransformer(nn.Module):
+    def __init__(self, prep, use_missing_embedding=True, corruption=0.0):
+        super().__init__()
+        self.prep = prep
+        self.use_missing_embedding = use_missing_embedding
+        self.corruption = corruption
+        d_model = CFG['d_model']
+        modules = []
+        for feature_type, cardinality in zip(prep['types'], prep['cardinalities']):
+            if feature_type == 'numeric':
+                modules.append(nn.Linear(1, d_model))
+            else:
+                modules.append(nn.Embedding(max(2, cardinality), d_model))
+        self.value_modules = nn.ModuleList(modules)
+        self.feature_embedding = nn.Embedding(len(prep['columns']), d_model)
+        self.missing_embedding = nn.Embedding(2, d_model) if use_missing_embedding else None
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=CFG['heads'],
+            dim_feedforward=CFG['ff'],
+            dropout=CFG['dropout'],
+            activation='gelu',
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=CFG['layers'])
+        self.norm = nn.LayerNorm(d_model)
+        self.head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(CFG['dropout']),
+            nn.Linear(d_model // 2, 1),
+        )
+        nn.init.normal_(self.cls_token, std=0.02)
+
+    def forward(self, values, missing):
+        if self.training and self.corruption > 0:
+            corrupt_mask = torch.rand_like(values) < self.corruption
+            values = values.clone()
+            missing = missing.clone()
+            values[corrupt_mask] = 0
+            missing[corrupt_mask] = 1
+        tokens = []
+        for j, feature_type in enumerate(self.prep['types']):
+            if feature_type == 'numeric':
+                token = self.value_modules[j](values[:, j:j+1])
+            else:
+                token = self.value_modules[j](
+                    values[:, j].round().long().clamp(0, self.prep['cardinalities'][j]-1)
+                )
+            token = token + self.feature_embedding.weight[j][None, :]
+            if self.missing_embedding is not None:
+                token = token + self.missing_embedding(missing[:, j].long().clamp(0, 1))
+            tokens.append(token)
+        sequence = torch.stack(tokens, dim=1)
+        cls = self.cls_token.expand(len(values), -1, -1)
+        encoded = self.encoder(torch.cat([cls, sequence], dim=1))[:, 0]
+        return self.head(self.norm(encoded)).squeeze(1)
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha, gamma=2.0):
+        super().__init__()
+        self.alpha = float(alpha)
+        self.gamma = float(gamma)
+
+    def forward(self, logits, target):
+        bce = nn.functional.binary_cross_entropy_with_logits(logits, target, reduction='none')
+        probability = torch.sigmoid(logits)
+        pt = torch.where(target == 1, probability, 1 - probability)
+        alpha = torch.where(
+            target == 1,
+            torch.full_like(target, self.alpha),
+            torch.full_like(target, 1 - self.alpha),
+        )
+        return (alpha * (1 - pt).pow(self.gamma) * bce).mean()
+
+
+def predict_neural(model, values, missing):
+    model.eval()
+    outputs = []
+    dataset = TensorDataset(torch.tensor(values), torch.tensor(missing))
+    with torch.no_grad():
+        for value_batch, missing_batch in DataLoader(dataset, batch_size=256, shuffle=False):
+            probability = torch.sigmoid(
+                model(value_batch.to(DEVICE), missing_batch.to(DEVICE))
+            )
+            outputs.append(probability.cpu().numpy())
+    return np.concatenate(outputs)
+
+
+def train_neural_fold(train_idx, test_idx, fold, variant):
+    train_x = X.iloc[train_idx].reset_index(drop=True)
+    test_x = X.iloc[test_idx].reset_index(drop=True)
+    train_y = y[train_idx]
+    prep = fit_preprocessor(train_x)
+    train_values, train_missing = transform_frame(train_x, prep)
+    test_values, test_missing = transform_frame(test_x, prep)
+    inner_train, inner_val = next(
+        StratifiedShuffleSplit(n_splits=1, test_size=0.18, random_state=SEED + 100*fold + len(variant))
+        .split(train_values, train_y)
+    )
+
+    if variant == 'MAT-Appendix':
+        use_missing_embedding, corruption, loss_kind = True, CFG['corruption'], 'focal'
+    elif variant == 'MAT-NoMissingEmbedding':
+        use_missing_embedding, corruption, loss_kind = False, CFG['corruption'], 'focal'
+    elif variant == 'FT-Transformer':
+        use_missing_embedding, corruption, loss_kind = False, 0.0, 'weighted_bce'
+    else:
+        raise ValueError(variant)
+
+    model = FeatureTokenTransformer(prep, use_missing_embedding, corruption).to(DEVICE)
+    positives = max(int(train_y[inner_train].sum()), 1)
+    negatives = len(inner_train) - positives
+    if loss_kind == 'focal':
+        loss_function = FocalLoss(alpha=negatives / len(inner_train))
+    else:
+        positive_weight = torch.tensor([negatives / positives], dtype=torch.float32, device=DEVICE)
+        loss_function = nn.BCEWithLogitsLoss(pos_weight=positive_weight)
+
+    generator = torch.Generator().manual_seed(SEED + 1000*fold + len(variant))
+    loader = DataLoader(
+        TensorDataset(
+            torch.tensor(train_values[inner_train]),
+            torch.tensor(train_missing[inner_train]),
+            torch.tensor(train_y[inner_train], dtype=torch.float32),
+        ),
+        batch_size=CFG['batch'],
+        shuffle=True,
+        generator=generator,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=CFG['lr'], weight_decay=CFG['weight_decay'])
+
+    best_score, best_state, stale, history = -np.inf, None, 0, []
+    for epoch in range(1, CFG['epochs'] + 1):
+        model.train()
+        losses = []
+        for value_batch, missing_batch, target_batch in loader:
+            optimizer.zero_grad()
+            logits = model(value_batch.to(DEVICE), missing_batch.to(DEVICE))
+            loss = loss_function(logits, target_batch.to(DEVICE))
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
