@@ -1,0 +1,162 @@
+        if index == bins - 1:
+            mask = (probability >= edges[index]) & (probability <= edges[index + 1])
+        else:
+            mask = (probability >= edges[index]) & (probability < edges[index + 1])
+        if mask.sum() == 0:
+            continue
+        observed = float(target[mask].mean())
+        predicted = float(probability[mask].mean())
+        gap = abs(observed - predicted)
+        ece_value += float(mask.mean()) * gap
+        mce_value = max(mce_value, gap)
+        rows.append([index + 1, int(mask.sum()), predicted, observed, gap])
+    return float(ece_value), float(mce_value), pd.DataFrame(
+        rows, columns=['bin', 'n', 'mean_probability', 'observed_rate', 'absolute_gap']
+    )
+
+
+def best_balanced_threshold(target, probability):
+    candidates = np.unique(np.quantile(probability, np.linspace(0.01, 0.99, 399)))
+    scores = [balanced_accuracy_score(target, probability >= threshold) for threshold in candidates]
+    return float(candidates[int(np.argmax(scores))])
+
+
+def sensitivity_threshold(target, probability, requested_sensitivity):
+    candidates = np.unique(np.r_[0.0, probability, 1.0])
+    valid = []
+    for threshold in candidates:
+        prediction = probability >= threshold
+        sensitivity = recall_score(target, prediction, zero_division=0)
+        if sensitivity >= requested_sensitivity:
+            specificity = recall_score(target, prediction, pos_label=0, zero_division=0)
+            valid.append((specificity, threshold))
+    if not valid:
+        return 0.0
+    valid.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return float(valid[0][1])
+
+
+def crossfit_calibrate(raw_probability, model_offset):
+    calibrated = np.full(len(y), np.nan)
+    classes = {
+        'balanced_accuracy': np.zeros(len(y), dtype=np.int8),
+        'sensitivity_90': np.zeros(len(y), dtype=np.int8),
+        'sensitivity_95': np.zeros(len(y), dtype=np.int8),
+    }
+    threshold_vectors = {key: np.full(len(y), np.nan) for key in classes}
+    calibrators = []
+    splitter = StratifiedKFold(5, shuffle=True, random_state=SEED + 97 + model_offset)
+    for train_idx, test_idx in splitter.split(raw_probability[:, None], y):
+        calibrator = LogisticRegression(C=1e6, solver='lbfgs', max_iter=2000)
+        calibrator.fit(safe_logit(raw_probability[train_idx]), y[train_idx])
+        calibrated[test_idx] = calibrator.predict_proba(safe_logit(raw_probability[test_idx]))[:, 1]
+        train_calibrated = calibrator.predict_proba(safe_logit(raw_probability[train_idx]))[:, 1]
+        fold_thresholds = {
+            'balanced_accuracy': best_balanced_threshold(y[train_idx], train_calibrated),
+            'sensitivity_90': sensitivity_threshold(y[train_idx], train_calibrated, 0.90),
+            'sensitivity_95': sensitivity_threshold(y[train_idx], train_calibrated, 0.95),
+        }
+        for key, threshold in fold_thresholds.items():
+            threshold_vectors[key][test_idx] = threshold
+            classes[key][test_idx] = calibrated[test_idx] >= threshold
+        calibrators.append(calibrator)
+    final_calibrator = LogisticRegression(C=1e6, solver='lbfgs', max_iter=2000)
+    final_calibrator.fit(safe_logit(raw_probability), y)
+    final_calibrated = final_calibrator.predict_proba(safe_logit(raw_probability))[:, 1]
+    deployment_thresholds = {
+        'balanced_accuracy': best_balanced_threshold(y, final_calibrated),
+        'sensitivity_90': sensitivity_threshold(y, final_calibrated, 0.90),
+        'sensitivity_95': sensitivity_threshold(y, final_calibrated, 0.95),
+    }
+    return {
+        'calibrated': calibrated,
+        'class': classes['balanced_accuracy'],
+        'classes': classes,
+        'threshold_vector': threshold_vectors['balanced_accuracy'],
+        'threshold_vectors': threshold_vectors,
+        'crossfit_calibrators': calibrators,
+        'final_calibrator': final_calibrator,
+        'deployment_thresholds': deployment_thresholds,
+    }
+
+
+def complete_metrics(target, probability, prediction, model_name, probability_type='calibrated'):
+    tn, fp, fn, tp = confusion_matrix(target, prediction, labels=[0, 1]).ravel()
+    sensitivity = tp / (tp + fn) if tp + fn else np.nan
+    specificity = tn / (tn + fp) if tn + fp else np.nan
+    precision = tp / (tp + fp) if tp + fp else 0.0
+    npv = tn / (tn + fn) if tn + fn else 0.0
+    accuracy = (tp + tn) / (tp + tn + fp + fn)
+    ece_value, mce_value, _ = calibration_errors(target, probability, CFG['calibration_bins'])
+    return {
+        'Model': model_name,
+        'Probability': probability_type,
+        'N': len(target),
+        'Positive_N': int(target.sum()),
+        'Prevalence': float(target.mean()),
+        'Accuracy': float(accuracy),
+        'Error_Rate': float(1 - accuracy),
+        'Balanced_Accuracy': float((sensitivity + specificity) / 2),
+        'Precision_PPV': float(precision),
+        'Recall_Sensitivity_TPR': float(sensitivity),
+        'Specificity_TNR': float(specificity),
+        'NPV': float(npv),
+        'F1': float(f1_score(target, prediction, zero_division=0)),
+        'F2': float(fbeta_score(target, prediction, beta=2, zero_division=0)),
+        'MCC': float(matthews_corrcoef(target, prediction)),
+        'Cohen_Kappa': float(cohen_kappa_score(target, prediction)),
+        'ROC_AUC': float(roc_auc_score(target, probability)),
+        'PR_AUC': float(average_precision_score(target, probability)),
+        'Brier': float(brier_score_loss(target, probability)),
+        'Log_Loss': float(log_loss(target, np.clip(probability, 1e-7, 1-1e-7))),
+        'ECE': float(ece_value),
+        'MCE': float(mce_value),
+        'FPR': float(fp / (fp + tn)) if fp + tn else np.nan,
+        'FNR': float(fn / (fn + tp)) if fn + tp else np.nan,
+        'TP': int(tp),
+        'TN': int(tn),
+        'FP': int(fp),
+        'FN': int(fn),
+    }
+
+calibration = {}
+primary_metric_rows = []
+raw_metric_rows = []
+calibration_bin_tables = []
+for offset, name in enumerate(ALL_MODELS):
+    calibration[name] = crossfit_calibrate(oof_raw[name], offset)
+    raw_metric_rows.append(
+        complete_metrics(y, oof_raw[name], oof_raw[name] >= 0.5, name, 'raw@0.5')
+    )
+    primary_metric_rows.append(
+        complete_metrics(
+            y,
+            calibration[name]['calibrated'],
+            calibration[name]['class'],
+            name,
+            'cross-fitted calibrated + cross-fitted threshold',
+        )
+    )
+    _, _, bin_table = calibration_errors(y, calibration[name]['calibrated'], CFG['calibration_bins'])
+    bin_table.insert(0, 'Model', name)
+    calibration_bin_tables.append(bin_table)
+
+metrics_raw = pd.DataFrame(raw_metric_rows)
+metrics_primary = pd.DataFrame(primary_metric_rows).sort_values('PR_AUC', ascending=False).reset_index(drop=True)
+calibration_bins = pd.concat(calibration_bin_tables, ignore_index=True)
+
+# Leakage-safe high-sensitivity operating points use cross-fitted calibrated
+# probabilities and thresholds selected only on the complementary calibration folds.
+mat_crossfit_probability = calibration['MAT-Appendix']['calibrated']
+operating_rows = []
+for label, prediction in calibration['MAT-Appendix']['classes'].items():
+    row = complete_metrics(y, mat_crossfit_probability, prediction, 'MAT-Appendix', label)
+    row['Mean_Crossfit_Threshold'] = float(np.mean(calibration['MAT-Appendix']['threshold_vectors'][label]))
+    row['Deployment_Threshold_All_OOF'] = calibration['MAT-Appendix']['deployment_thresholds'][label]
+    operating_rows.append(row)
+operating_points = pd.DataFrame(operating_rows)
+
+# 1,000 bootstrap CIs for every reported metric and model.
+BOOT_METRICS = [
+    'Accuracy', 'Error_Rate', 'Balanced_Accuracy', 'Precision_PPV',
+    'Recall_Sensitivity_TPR', 'Specificity_TNR', 'NPV', 'F1', 'F2', 'MCC',
