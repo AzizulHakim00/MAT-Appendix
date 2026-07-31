@@ -1,0 +1,191 @@
+        'shap_values': shap_values.astype(np.float32),
+        'expected_value': float(np.asarray(explainer.expected_value).reshape(-1)[-1]),
+        'aggregated': aggregated.to_dict('records'),
+    }
+    xai_status['SHAP'] = 'completed'
+except Exception as exc:
+    aggregated = pd.DataFrame(columns=['Feature', 'MeanAbsSHAP_Value', 'MeanAbsSHAP_Missing', 'MeanAbsSHAP_Total', 'Missing_Share'])
+    xai_status['SHAP'] = 'failed: ' + str(exc)
+
+try:
+    from lime.lime_tabular import LimeTabularExplainer
+    categorical_indices = [j for j, kind in enumerate(prep['types']) if kind == 'categorical'] + list(range(feature_count, 2*feature_count))
+    lime_explainer = LimeTabularExplainer(
+        train_joined,
+        feature_names=expanded_names,
+        class_names=['uncomplicated', 'complicated'],
+        categorical_features=categorical_indices,
+        mode='classification',
+        random_state=SEED,
+    )
+    representative_truth = y[np.asarray(representative['test_idx'])]
+    candidates = np.where(representative_truth == 1)[0]
+    if len(candidates) == 0:
+        candidates = np.arange(len(representative_truth))
+    selected = int(candidates[np.argmax(black_box(test_joined[candidates]))])
+    explanation = lime_explainer.explain_instance(
+        test_joined[selected],
+        lambda z: np.c_[1-black_box(z), black_box(z)],
+        num_features=min(15, 2*feature_count),
+        labels=(1,),
+    )
+    lime_payload = {
+        'fold': representative['fold'],
+        'row': int(representative['test_idx'][selected]),
+        'truth': int(representative_truth[selected]),
+        'probability': float(black_box(test_joined[[selected]])[0]),
+        'items': explanation.as_list(label=1),
+    }
+    explanation.save_to_file(str(OUT/'figures'/'lime_explanation.html'))
+    xai_status['LIME'] = 'completed'
+except Exception as exc:
+    xai_status['LIME'] = 'failed: ' + str(exc)
+
+# -----------------------------------------------------------------------------
+# 7. Age, sex and missingness subgroup analysis
+# -----------------------------------------------------------------------------
+def find_feature_by_tokens(tokens):
+    for column in X.columns:
+        low = column.lower()
+        if any(token in low for token in tokens):
+            return column
+    return None
+
+age_column = find_feature_by_tokens(['age'])
+sex_column = find_feature_by_tokens(['sex', 'gender'])
+row_missing_fraction = X.isna().mean(axis=1)
+subgroup_labels = {}
+if age_column is not None:
+    age_values = pd.to_numeric(X[age_column], errors='coerce')
+    subgroup_labels['Age'] = pd.cut(
+        age_values,
+        bins=[-np.inf, 9.999, 13.999, np.inf],
+        labels=['<10', '10-13', '>=14'],
+    ).astype('string').fillna('Missing')
+if sex_column is not None:
+    subgroup_labels['Sex'] = X[sex_column].astype('string').fillna('Missing')
+try:
+    subgroup_labels['Missingness'] = pd.qcut(
+        row_missing_fraction.rank(method='first'),
+        q=3,
+        labels=['Low', 'Medium', 'High'],
+    ).astype('string')
+except Exception:
+    subgroup_labels['Missingness'] = pd.cut(
+        row_missing_fraction,
+        bins=[-np.inf, row_missing_fraction.median(), np.inf],
+        labels=['Low', 'High'],
+    ).astype('string')
+
+subgroup_rows = []
+mat_probability = calibration['MAT-Appendix']['calibrated']
+mat_prediction = calibration['MAT-Appendix']['class']
+for subgroup_type, labels in subgroup_labels.items():
+    labels = pd.Series(labels).reset_index(drop=True)
+    for level in sorted(labels.dropna().unique().tolist()):
+        mask = labels.eq(level).to_numpy()
+        if mask.sum() < 20:
+            continue
+        row = {
+            'Subgroup': subgroup_type,
+            'Level': str(level),
+            'N': int(mask.sum()),
+            'Positive_N': int(y[mask].sum()),
+            'Prevalence': float(y[mask].mean()),
+        }
+        if len(np.unique(y[mask])) == 2:
+            metrics = complete_metrics(
+                y[mask], mat_probability[mask], mat_prediction[mask], 'MAT-Appendix'
+            )
+            for key in ['ROC_AUC', 'PR_AUC', 'Accuracy', 'Balanced_Accuracy', 'Recall_Sensitivity_TPR', 'Specificity_TNR', 'Precision_PPV', 'NPV', 'F1', 'MCC', 'Brier', 'ECE']:
+                row[key] = metrics[key]
+        subgroup_rows.append(row)
+subgroup_results = pd.DataFrame(subgroup_rows)
+
+# -----------------------------------------------------------------------------
+# 8. Tables and paper-ready figures
+# -----------------------------------------------------------------------------
+def save_figure(fig, name):
+    fig.savefig(OUT/'figures'/f'{name}.png', dpi=300, bbox_inches='tight')
+    fig.savefig(OUT/'figures'/f'{name}.pdf', bbox_inches='tight')
+    plt.show()
+    plt.close(fig)
+
+missingness = pd.DataFrame({
+    'Feature': X.columns,
+    'Missing_Fraction': X.isna().mean().to_numpy(),
+}).sort_values('Missing_Fraction', ascending=False)
+
+fig, ax = plt.subplots(figsize=(7, 4))
+ax.bar(['Uncomplicated', 'Complicated'], [int((y==0).sum()), int((y==1).sum())])
+ax.set_ylabel('Patients')
+ax.set_title('Confirmed appendicitis severity cohort')
+save_figure(fig, '01_class_distribution')
+
+fig, ax = plt.subplots(figsize=(9, 6))
+plot_missing = missingness.head(20).sort_values('Missing_Fraction')
+ax.barh(plot_missing['Feature'], plot_missing['Missing_Fraction'])
+ax.set_xlabel('Missing fraction')
+ax.set_title('Top missing clinical variables')
+save_figure(fig, '02_missingness')
+
+fig, ax = plt.subplots(figsize=(8, 6))
+for name in ALL_MODELS:
+    probability = calibration[name]['calibrated']
+    fpr, tpr, _ = roc_curve(y, probability)
+    ax.plot(fpr, tpr, label=f'{name} ({roc_auc_score(y, probability):.3f})')
+ax.plot([0, 1], [0, 1], '--')
+ax.set_xlabel('False positive rate')
+ax.set_ylabel('True positive rate')
+ax.set_title('Five-fold OOF ROC curves')
+ax.legend(fontsize=7)
+save_figure(fig, '03_roc_all_models')
+
+fig, ax = plt.subplots(figsize=(8, 6))
+for name in ALL_MODELS:
+    probability = calibration[name]['calibrated']
+    precision, recall, _ = precision_recall_curve(y, probability)
+    ax.plot(recall, precision, label=f'{name} ({average_precision_score(y, probability):.3f})')
+ax.axhline(y.mean(), linestyle='--', label=f'Prevalence ({y.mean():.3f})')
+ax.set_xlabel('Recall')
+ax.set_ylabel('Precision')
+ax.set_title('Five-fold OOF precision-recall curves')
+ax.legend(fontsize=7)
+save_figure(fig, '04_pr_all_models')
+
+fig, ax = plt.subplots(figsize=(8, 6))
+for name in ALL_MODELS:
+    observed, predicted = calibration_curve(y, calibration[name]['calibrated'], n_bins=10, strategy='quantile')
+    ax.plot(predicted, observed, marker='o', label=name)
+ax.plot([0, 1], [0, 1], '--')
+ax.set_xlabel('Mean predicted probability')
+ax.set_ylabel('Observed event rate')
+ax.set_title('Cross-fitted calibration curves')
+ax.legend(fontsize=7)
+save_figure(fig, '05_calibration_all_models')
+
+fig, ax = plt.subplots(figsize=(10, 5))
+order = metrics_primary.sort_values('PR_AUC', ascending=False)
+ax.bar(order['Model'], order['Error_Rate'])
+ax.set_ylabel('Error rate')
+ax.set_title('OOF error rate by model')
+ax.tick_params(axis='x', rotation=35)
+save_figure(fig, '06_error_rate')
+
+fig, ax = plt.subplots(figsize=(10, 5))
+x_positions = np.arange(len(order))
+width = 0.38
+ax.bar(x_positions-width/2, order['ECE'], width, label='ECE')
+ax.bar(x_positions+width/2, order['MCE'], width, label='MCE')
+ax.set_xticks(x_positions)
+ax.set_xticklabels(order['Model'], rotation=35, ha='right')
+ax.set_title('Calibration error by model')
+ax.legend()
+save_figure(fig, '07_calibration_error')
+
+fig, ax = plt.subplots(figsize=(10, 5))
+for name in ALL_MODELS:
+    fold_data = fold_metrics.query('model == @name').sort_values('fold')
+    ax.plot(fold_data['fold'], fold_data['PR_AUC'], marker='o', label=name)
+ax.set_xlabel('Outer fold')
+ax.set_ylabel('PR-AUC')
