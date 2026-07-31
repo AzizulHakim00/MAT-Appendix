@@ -1,0 +1,204 @@
+# MAT-Appendix complete conference pipeline
+# Confirmed appendicitis-only severity cohort; 5-fold OOF; full metrics, baselines, ablation, calibration, XAI and reusable PKL.
+import os, sys, subprocess, json, random, hashlib, shutil, tempfile, platform, warnings, math
+from pathlib import Path
+from datetime import datetime, timezone
+
+subprocess.check_call([
+    sys.executable, '-m', 'pip', 'install', '-q',
+    'ucimlrepo', 'joblib', 'shap', 'lime', 'openpyxl', 'catboost', 'xgboost'
+])
+
+import numpy as np
+import pandas as pd
+import joblib
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
+from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    accuracy_score, balanced_accuracy_score, precision_score, recall_score,
+    f1_score, fbeta_score, matthews_corrcoef, cohen_kappa_score,
+    roc_auc_score, average_precision_score, brier_score_loss, log_loss,
+    confusion_matrix, roc_curve, precision_recall_curve
+)
+from sklearn.calibration import calibration_curve
+from catboost import CatBoostClassifier
+from xgboost import XGBClassifier
+from ucimlrepo import fetch_ucirepo
+from IPython.display import display
+
+warnings.filterwarnings('ignore')
+
+CFG = dict(
+    seed=2026,
+    folds=5,
+    epochs=110,
+    patience=15,
+    batch=64,
+    d_model=48,
+    heads=4,
+    layers=2,
+    ff=128,
+    dropout=0.25,
+    lr=8e-4,
+    weight_decay=1e-4,
+    corruption=0.05,
+    bootstrap=1000,
+    calibration_bins=10,
+    permutation_repeats=5,
+    repo='AzizulHakim00/MAT-Appendix',
+    branch='main',
+)
+
+SEED = CFG['seed']
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+torch.use_deterministic_algorithms(True, warn_only=True)
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+RUN_ID = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+
+try:
+    from google.colab import drive
+    drive.mount('/content/drive', force_remount=False)
+    ROOT = Path('/content/drive/MyDrive/MAT-Appendix')
+except Exception as exc:
+    print('Google Drive unavailable; using /content:', exc)
+    ROOT = Path('/content/MAT-Appendix')
+
+OUT = ROOT / 'runs' / RUN_ID
+for folder in [OUT, OUT/'tables', OUT/'figures', OUT/'models']:
+    folder.mkdir(parents=True, exist_ok=True)
+print('Device:', DEVICE)
+print('Run ID:', RUN_ID)
+print('Output:', OUT)
+
+# -----------------------------------------------------------------------------
+# 1. Direct URL-backed dataset load and confirmed-appendicitis cohort
+# -----------------------------------------------------------------------------
+data = fetch_ucirepo(id=938)
+X_all = data.data.features.copy()
+Y_all = data.data.targets.copy()
+
+def clean_name(value):
+    return str(value).strip().replace(' ', '_').replace('-', '_').replace('/', '_')
+
+X_all.columns = [clean_name(c) for c in X_all.columns]
+Y_all.columns = [clean_name(c) for c in Y_all.columns]
+
+def find_column(df, exact):
+    matches = [c for c in df.columns if c.lower() == exact.lower()]
+    if not matches:
+        raise KeyError(f'Required column {exact!r} was not found. Available: {list(df.columns)}')
+    return matches[0]
+
+diagnosis_col = find_column(Y_all, 'Diagnosis')
+severity_col = find_column(Y_all, 'Severity')
+diagnosis = Y_all[diagnosis_col].astype('string').str.strip().str.lower()
+severity = Y_all[severity_col].astype('string').str.strip().str.lower()
+
+confirmed = diagnosis.eq('appendicitis')
+valid_severity = severity.isin(['complicated', 'uncomplicated'])
+cohort_mask = confirmed & valid_severity
+X = X_all.loc[cohort_mask].reset_index(drop=True)
+y = severity.loc[cohort_mask].eq('complicated').astype(np.int8).to_numpy()
+source_rows = X_all.index[cohort_mask].astype(str).tolist()
+
+# Strict leakage audit: remove identifiers, post-decision variables, target variables,
+# direct complication-defining variables and procedure/pathology variables.
+BLOCK_EXACT = {
+    'Length_of_Stay', 'Management', 'Severity', 'Diagnosis',
+    'Diagnosis_Presumptive', 'Patient_ID', 'ID', 'Outcome', 'Discharge_Status'
+}
+BLOCK_PATTERNS = {
+    'post_decision': ['severity', 'diagnos', 'management', 'length_of_stay', 'discharge', 'outcome'],
+    'procedure_or_pathology': ['surg', 'operat', 'histopath', 'patholog', 'appendectomy'],
+    'direct_complication_definition': ['perfor', 'abscess', 'gangren', 'complic', 'periton'],
+}
+
+def leakage_reason(column):
+    low = column.lower()
+    if column in BLOCK_EXACT or low in {'id', 'patientid', 'patient_id'}:
+        return 'identifier/target/post-decision'
+    for reason, patterns in BLOCK_PATTERNS.items():
+        if any(token in low for token in patterns):
+            return reason
+    return ''
+
+audit_rows, keep_columns = [], []
+for column in X.columns:
+    reason = leakage_reason(column)
+    if reason:
+        audit_rows.append([column, 'DROP', reason])
+    else:
+        audit_rows.append([column, 'KEEP', 'admission-time candidate'])
+        keep_columns.append(column)
+X = X[keep_columns].copy()
+
+for column in X.select_dtypes(include=['object', 'string']).columns:
+    X[column] = X[column].replace(
+        r'^\s*(?:\?|na|n/a|nan|none|null|unknown|not available)\s*$',
+        np.nan,
+        regex=True,
+    )
+
+constant_columns = [c for c in X.columns if X[c].nunique(dropna=True) <= 1]
+for column in constant_columns:
+    audit_rows.append([column, 'DROP', 'constant/empty'])
+X = X.drop(columns=constant_columns)
+audit = pd.DataFrame(audit_rows, columns=['feature', 'action', 'reason']).drop_duplicates('feature', keep='last')
+
+if len(y) < 200 or len(np.unique(y)) != 2:
+    raise ValueError(f'Unexpected confirmed-appendicitis severity cohort: n={len(y)}, classes={np.unique(y)}')
+
+hash_frame = X.astype('string').fillna('<NA>')
+hash_frame['target'] = y.astype(str)
+data_hash = hashlib.sha256(
+    pd.util.hash_pandas_object(hash_frame, index=True).values.tobytes()
+).hexdigest()
+
+cohort = pd.DataFrame({
+    'item': ['confirmed_appendicitis_rows', 'complicated', 'uncomplicated', 'prevalence', 'features', 'sha256'],
+    'value': [len(y), int(y.sum()), int(len(y)-y.sum()), float(y.mean()), int(X.shape[1]), data_hash],
+})
+display(cohort)
+display(audit.query("action == 'DROP'").reset_index(drop=True))
+
+# -----------------------------------------------------------------------------
+# 2. Fold-safe preprocessing
+# -----------------------------------------------------------------------------
+def is_numeric_series(series):
+    if pd.api.types.is_numeric_dtype(series):
+        return True
+    nonmissing = series.notna().sum()
+    if nonmissing == 0:
+        return False
+    converted = pd.to_numeric(series, errors='coerce')
+    return converted.notna().sum() / nonmissing >= 0.95
+
+
+def fit_preprocessor(df):
+    prep = {'columns': list(df.columns), 'types': [], 'numeric': {}, 'categorical': {}, 'cardinalities': []}
+    for column in prep['columns']:
+        series = df[column]
+        if is_numeric_series(series):
+            numeric = pd.to_numeric(series, errors='coerce').astype(float)
+            median = float(numeric.median()) if numeric.notna().any() else 0.0
+            filled = numeric.fillna(median)
+            mean = float(filled.mean())
+            std = float(filled.std(ddof=0))
+            if not np.isfinite(std) or std <= 1e-8:
+                std = 1.0
+            prep['types'].append('numeric')
+            prep['numeric'][column] = (median, mean, std)
+            prep['cardinalities'].append(0)
+        else:
+            values = sorted(series.dropna().astype(str).str.strip().unique())
