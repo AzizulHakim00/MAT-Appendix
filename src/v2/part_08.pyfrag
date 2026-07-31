@@ -1,0 +1,133 @@
+    'operating_points': operating_points.to_dict('records'),
+    'strongest_baseline': strongest_baseline,
+    'paired_bootstrap': paired_bootstrap.to_dict('records'),
+    'xai_status': xai_status,
+}
+json.dump(paper_results, open(OUT/'paper_results.json', 'w'), indent=2)
+json.dump(versions, open(OUT/'software_versions.json', 'w'), indent=2)
+
+(OUT/'MODEL_CARD.md').write_text(
+    f"""# MAT-Appendix model card
+
+- Run: `{RUN_ID}`
+- Dataset: UCI 938
+- Confirmed cohort: `Diagnosis == appendicitis`
+- Endpoint: complicated versus uncomplicated appendicitis
+- Evaluation: five outer stratified OOF folds
+- Proposed MAT-Appendix fits: exactly five
+- Calibration: cross-fitted Platt scaling
+- Threshold: cross-fitted development-only balanced-accuracy threshold
+- Dataset SHA-256: `{data_hash}`
+
+This is retrospective research software and not a clinical decision system.
+"""
+)
+
+(OUT/'LIMITATIONS.md').write_text(
+    """# Study limitations
+
+- Single-center retrospective pediatric cohort.
+- Small complicated-appendicitis sample limits precision and subgroup certainty.
+- No external hospital validation is available in this primary experiment.
+- Missingness may encode local clinical workflow as well as physiology.
+- SHAP and LIME are explanatory approximations, not causal evidence.
+- The system must not be described as clinical-deployment-ready or state-of-the-art without external validation and direct literature-matched comparisons.
+"""
+)
+
+manifest = {}
+for file in OUT.rglob('*'):
+    if file.is_file():
+        manifest[str(file.relative_to(OUT))] = {
+            'bytes': file.stat().st_size,
+            'sha256': hashlib.sha256(file.read_bytes()).hexdigest(),
+        }
+json.dump({'run_id': RUN_ID, 'files': manifest}, open(OUT/'manifest.json', 'w'), indent=2)
+
+zip_path = shutil.make_archive(
+    str(OUT.parent/f'MAT_Appendix_Conference_Assets_{RUN_ID}'),
+    'zip',
+    root_dir=OUT,
+)
+shutil.move(zip_path, OUT/Path(zip_path).name)
+
+print('\nPRIMARY COMPLETE METRIC TABLE')
+display(metrics_primary)
+print('\nHIGH-SENSITIVITY OPERATING POINTS')
+display(operating_points)
+print('\nPAIRED BOOTSTRAP COMPARISON')
+display(paired_bootstrap)
+print('\nSUBGROUP RESULTS')
+display(subgroup_results)
+print('\nXAI STATUS')
+display(pd.DataFrame([xai_status]))
+print('Reproducibility bundle:', bundle_path)
+
+# GitHub export. Add GITHUB_TOKEN in Colab Secrets with repository Contents: read/write.
+def get_github_token():
+    try:
+        from google.colab import userdata
+        return (userdata.get('GITHUB_TOKEN') or '').strip()
+    except Exception:
+        return os.environ.get('GITHUB_TOKEN', '').strip()
+
+
+def push_results_to_github():
+    token = get_github_token()
+    if not token:
+        return {
+            'status': 'skipped',
+            'reason': 'GITHUB_TOKEN missing. Add it to Colab Secrets and rerun only the GitHub export block; model retraining is not required.',
+        }
+    work = Path(tempfile.mkdtemp())
+    repo_dir = work/'repo'
+    env = os.environ.copy()
+    env['GITHUB_TOKEN'] = token
+    askpass = work/'askpass.sh'
+    askpass.write_text(
+        '#!/bin/sh\ncase "$1" in *Username*) echo x-access-token;; *Password*) echo "$GITHUB_TOKEN";; esac\n'
+    )
+    askpass.chmod(0o700)
+    env['GIT_ASKPASS'] = str(askpass)
+    env['GIT_TERMINAL_PROMPT'] = '0'
+    subprocess.check_call([
+        'git', 'clone', '--depth', '1', '--branch', CFG['branch'],
+        f"https://github.com/{CFG['repo']}.git", str(repo_dir)
+    ], env=env)
+
+    destination = repo_dir/'results'/'runs'/RUN_ID
+    destination.mkdir(parents=True, exist_ok=True)
+    # Push paper assets and the reusable PKL; omit duplicate ZIP and individual PT files.
+    for relative in ['tables', 'figures']:
+        shutil.copytree(OUT/relative, destination/relative, dirs_exist_ok=True)
+    for filename in [
+        'mat_appendix_complete_reproducibility.pkl', 'paper_results.json',
+        'software_versions.json', 'MODEL_CARD.md', 'LIMITATIONS.md', 'manifest.json'
+    ]:
+        shutil.copy2(OUT/filename, destination/filename)
+
+    size_limit = 95 * 1024 * 1024
+    oversized = [f for f in destination.rglob('*') if f.is_file() and f.stat().st_size > size_limit]
+    if oversized:
+        names = ', '.join(str(f.relative_to(destination)) for f in oversized)
+        raise RuntimeError(f'GitHub 100 MB file limit risk: {names}. Keep those files in Drive or use Git LFS.')
+
+    latest = repo_dir/'results'/'LATEST_RUN.txt'
+    latest.parent.mkdir(parents=True, exist_ok=True)
+    latest.write_text(RUN_ID + '\n')
+    subprocess.check_call(['git', '-C', str(repo_dir), 'config', 'user.name', 'MAT-Appendix Colab'])
+    subprocess.check_call(['git', '-C', str(repo_dir), 'config', 'user.email', 'actions@users.noreply.github.com'])
+    subprocess.check_call(['git', '-C', str(repo_dir), 'add', 'results'])
+    subprocess.check_call(['git', '-C', str(repo_dir), 'commit', '-m', f'Add conference-complete MAT-Appendix run {RUN_ID}'])
+    subprocess.check_call(['git', '-C', str(repo_dir), 'push', 'origin', CFG['branch']], env=env)
+    commit = subprocess.check_output(['git', '-C', str(repo_dir), 'rev-parse', 'HEAD'], text=True).strip()
+    shutil.rmtree(work, ignore_errors=True)
+    return {'status': 'pushed', 'commit': commit, 'run_id': RUN_ID}
+
+try:
+    github_status = push_results_to_github()
+except Exception as exc:
+    github_status = {'status': 'failed', 'reason': str(exc)}
+json.dump(github_status, open(OUT/'github_push_status.json', 'w'), indent=2)
+print('GitHub export:', github_status)
+print('DONE. MAT-Appendix was trained exactly once in each of five OOF folds.')
