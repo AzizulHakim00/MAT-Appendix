@@ -8,6 +8,8 @@
 
 [![Load Latest Conference Artifacts](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/AzizulHakim00/MAT-Appendix/blob/main/MAT_Appendix_Load_Conference_Artifacts.ipynb)
 
+[![Upload Existing Drive Run](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/AzizulHakim00/MAT-Appendix/blob/main/MAT_Appendix_Upload_Existing_Conference_Run.ipynb)
+
 Run `MAT_Appendix_Conference_Complete.ipynb` for the paper analysis. It uses the clinically correct cohort:
 
 - `Diagnosis == appendicitis`;
@@ -45,7 +47,7 @@ Generated outputs include:
 - 90% and 95% sensitivity operating points;
 - model-specific confusion matrices;
 - paired bootstrap comparisons against every baseline;
-- fold stability, ROC, PR, calibration-error and error-rate figures;
+- fold stability, ROC, PR, core-metric, calibration-error, probability-loss and error-rate figures;
 - fold-aggregated permutation importance;
 - SHAP value-versus-missingness aggregation;
 - SHAP beeswarm and LIME local explanation;
@@ -53,18 +55,7 @@ Generated outputs include:
 
 ## Reproducibility
 
-The run writes `mat_appendix_complete_reproducibility.pkl`, containing:
-
-- exact fold indices;
-- fold-specific preprocessing;
-- five proposed-model CPU state dictionaries;
-- raw and calibrated OOF predictions for all models;
-- cross-fitted classes and thresholds;
-- calibration objects;
-- full metrics and confidence intervals;
-- paired-bootstrap results;
-- XAI arrays and subgroup results;
-- dataset SHA-256 and software versions.
+The run writes `mat_appendix_complete_reproducibility.pkl`, containing exact folds, fold-specific preprocessing, five proposed-model CPU state dictionaries, all raw/calibrated OOF predictions, thresholds, calibration objects, full metrics, confidence intervals, paired-bootstrap results, XAI arrays, subgroup results, dataset SHA-256 and software versions.
 
 After a successful GitHub export, `MAT_Appendix_Load_Conference_Artifacts.ipynb` loads the latest PKL without retraining.
 
@@ -79,11 +70,17 @@ results/runs/<RUN_ID>/
 results/LATEST_RUN.txt
 ```
 
-The GitHub export intentionally omits duplicate ZIP files and individual `.pt` files because the compressed PKL already contains the five proposed-model states.
+If the run saves to Drive but GitHub export is skipped, use `MAT_Appendix_Upload_Existing_Conference_Run.ipynb`; it uploads the completed run without retraining.
 
 ## Source layout
 
-The single Colab cell concatenates the syntax-checked files under `src/v2/part_01.pyfrag` through `src/v2/part_08.pyfrag` and executes them in the same cell.
+The single Colab cell concatenates these syntax-checked fragments:
+
+- `src/v2/part_01.pyfrag` through `src/v2/part_06.pyfrag`
+- `src/v2/part_07_pre.pyfrag`
+- `src/v2/part_07b.pyfrag`
+- `src/v2/part_07_post.pyfrag`
+- `src/v2/part_08.pyfrag`
 
 ## Earlier exploratory notebook
 
