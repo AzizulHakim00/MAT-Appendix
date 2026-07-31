@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
+.env
+*.token
+# Completed paper artifacts under results/runs are intentionally versioned by the Colab pipeline.
