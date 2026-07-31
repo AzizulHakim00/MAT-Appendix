@@ -1,0 +1,159 @@
+    'Cohen_Kappa', 'ROC_AUC', 'PR_AUC', 'Brier', 'Log_Loss', 'ECE', 'MCE',
+    'FPR', 'FNR'
+]
+
+def bootstrap_cis():
+    rng = np.random.default_rng(SEED + 123)
+    rows = []
+    for name in ALL_MODELS:
+        probability = calibration[name]['calibrated']
+        prediction = calibration[name]['class']
+        estimate = complete_metrics(y, probability, prediction, name)
+        samples = {metric: [] for metric in BOOT_METRICS}
+        for _ in range(CFG['bootstrap']):
+            index = rng.integers(0, len(y), len(y))
+            if len(np.unique(y[index])) < 2:
+                continue
+            sample_metrics = complete_metrics(
+                y[index], probability[index], prediction[index], name
+            )
+            for metric in BOOT_METRICS:
+                value = sample_metrics[metric]
+                if np.isfinite(value):
+                    samples[metric].append(value)
+        for metric in BOOT_METRICS:
+            values = np.asarray(samples[metric], dtype=float)
+            rows.append({
+                'Model': name,
+                'Metric': metric,
+                'Estimate': estimate[metric],
+                'CI_2.5%': float(np.quantile(values, 0.025)),
+                'CI_97.5%': float(np.quantile(values, 0.975)),
+                'Bootstrap_N': int(len(values)),
+            })
+    return pd.DataFrame(rows)
+
+bootstrap_ci = bootstrap_cis()
+
+# Paired bootstrap: MAT vs every true baseline, with strongest baseline flagged by PR-AUC.
+BASELINE_MODELS = CLASSICAL_NAMES + ['FT-Transformer']
+strongest_baseline = max(BASELINE_MODELS, key=lambda name: average_precision_score(y, calibration[name]['calibrated']))
+
+def paired_bootstrap_comparison():
+    rng = np.random.default_rng(SEED + 777)
+    rows = []
+    mat_p = calibration['MAT-Appendix']['calibrated']
+    for baseline in BASELINE_MODELS:
+        base_p = calibration[baseline]['calibrated']
+        for metric in ['ROC_AUC', 'PR_AUC', 'Brier']:
+            differences = []
+            for _ in range(CFG['bootstrap']):
+                index = rng.integers(0, len(y), len(y))
+                if len(np.unique(y[index])) < 2:
+                    continue
+                if metric == 'ROC_AUC':
+                    difference = roc_auc_score(y[index], mat_p[index]) - roc_auc_score(y[index], base_p[index])
+                elif metric == 'PR_AUC':
+                    difference = average_precision_score(y[index], mat_p[index]) - average_precision_score(y[index], base_p[index])
+                else:
+                    # Lower Brier is better; positive difference favors MAT.
+                    difference = brier_score_loss(y[index], base_p[index]) - brier_score_loss(y[index], mat_p[index])
+                differences.append(difference)
+            differences = np.asarray(differences)
+            p_value = 2 * min((differences <= 0).mean(), (differences >= 0).mean())
+            rows.append({
+                'Baseline': baseline,
+                'Strongest_Baseline': baseline == strongest_baseline,
+                'Metric': metric,
+                'Difference_Favoring_MAT': float(np.mean(differences)),
+                'CI_2.5%': float(np.quantile(differences, 0.025)),
+                'CI_97.5%': float(np.quantile(differences, 0.975)),
+                'Paired_Bootstrap_p': float(min(p_value, 1.0)),
+            })
+    return pd.DataFrame(rows)
+
+paired_bootstrap = paired_bootstrap_comparison()
+
+# -----------------------------------------------------------------------------
+# 6. XAI: fold-aggregated permutation, representative-fold SHAP/LIME and aggregated value+missing SHAP
+# -----------------------------------------------------------------------------
+rng = np.random.default_rng(SEED + 222)
+permutation_rows = []
+for artifact in neural_artifacts['MAT-Appendix']:
+    model = restore_neural(artifact)
+    test_idx = np.asarray(artifact['test_idx'])
+    test_x = X.iloc[test_idx].reset_index(drop=True)
+    values, missing = transform_frame(test_x, artifact['preprocessor'])
+    baseline_pr = average_precision_score(y[test_idx], predict_neural(model, values, missing))
+    for feature in X.columns:
+        drops = []
+        for _ in range(CFG['permutation_repeats']):
+            shuffled = test_x.copy()
+            shuffled[feature] = rng.permutation(shuffled[feature].to_numpy())
+            v_shuffled, m_shuffled = transform_frame(shuffled, artifact['preprocessor'])
+            shuffled_pr = average_precision_score(
+                y[test_idx], predict_neural(model, v_shuffled, m_shuffled)
+            )
+            drops.append(baseline_pr - shuffled_pr)
+        permutation_rows.append([artifact['fold'], feature, float(np.mean(drops))])
+permutation_raw = pd.DataFrame(permutation_rows, columns=['Fold', 'Feature', 'PR_AUC_Drop'])
+permutation = (
+    permutation_raw.groupby('Feature')['PR_AUC_Drop']
+    .agg(['mean', 'std']).reset_index()
+    .sort_values('mean', ascending=False)
+)
+
+xai_status, shap_payload, lime_payload = {}, {}, {}
+mat_fold_table = fold_metrics.query("model == 'MAT-Appendix'").reset_index(drop=True)
+representative_index = int((mat_fold_table['PR_AUC'] - mat_fold_table['PR_AUC'].median()).abs().idxmin())
+representative = neural_artifacts['MAT-Appendix'][representative_index]
+representative_model = restore_neural(representative)
+prep = representative['preprocessor']
+train_x = X.iloc[representative['train_idx']].reset_index(drop=True)
+test_x = X.iloc[representative['test_idx']].reset_index(drop=True)
+train_values, train_missing = transform_frame(train_x, prep)
+test_values, test_missing = transform_frame(test_x, prep)
+feature_count = test_values.shape[1]
+train_joined = np.c_[train_values, train_missing]
+test_joined = np.c_[test_values, test_missing]
+expanded_names = [f'{c}__value' for c in X.columns] + [f'{c}__missing' for c in X.columns]
+
+def black_box(joined):
+    joined = np.asarray(joined, dtype=np.float32)
+    values = joined[:, :feature_count].copy()
+    missing = np.rint(joined[:, feature_count:]).clip(0, 1).astype(int)
+    for j, feature_type in enumerate(prep['types']):
+        if feature_type == 'categorical':
+            values[:, j] = np.rint(values[:, j]).clip(0, prep['cardinalities'][j] - 1)
+    return predict_neural(representative_model, values, missing)
+
+try:
+    import shap
+    local_rng = np.random.default_rng(SEED + 333)
+    background = train_joined[local_rng.choice(len(train_joined), min(20, len(train_joined)), replace=False)]
+    explained_indices = local_rng.choice(len(test_joined), min(30, len(test_joined)), replace=False)
+    explained = test_joined[explained_indices]
+    explainer = shap.KernelExplainer(black_box, background)
+    shap_values = explainer.shap_values(explained, nsamples=120)
+    shap_values = np.asarray(shap_values[-1] if isinstance(shap_values, list) else shap_values)
+    shap_values = np.squeeze(shap_values)
+    if shap_values.ndim == 1:
+        shap_values = shap_values[None, :]
+    absolute = np.abs(shap_values)
+    aggregated = pd.DataFrame({
+        'Feature': list(X.columns),
+        'MeanAbsSHAP_Value': absolute[:, :feature_count].mean(axis=0),
+        'MeanAbsSHAP_Missing': absolute[:, feature_count:].mean(axis=0),
+    })
+    aggregated['MeanAbsSHAP_Total'] = aggregated['MeanAbsSHAP_Value'] + aggregated['MeanAbsSHAP_Missing']
+    aggregated['Missing_Share'] = np.divide(
+        aggregated['MeanAbsSHAP_Missing'],
+        aggregated['MeanAbsSHAP_Total'],
+        out=np.zeros(len(aggregated)),
+        where=aggregated['MeanAbsSHAP_Total'].to_numpy() > 0,
+    )
+    aggregated = aggregated.sort_values('MeanAbsSHAP_Total', ascending=False)
+    shap_payload = {
+        'fold': representative['fold'],
+        'expanded_feature_names': expanded_names,
+        'explained_values': explained.astype(np.float32),
