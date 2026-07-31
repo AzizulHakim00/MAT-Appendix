@@ -1,0 +1,191 @@
+ax.set_xticks(range(1, CFG['folds']+1))
+ax.set_title('Fold-level PR-AUC stability')
+ax.legend(fontsize=7)
+save_figure(fig, '08_fold_stability')
+
+fig, ax = plt.subplots(figsize=(8, 5))
+ax.plot(operating_points['Recall_Sensitivity_TPR'], operating_points['Specificity_TNR'], marker='o')
+for _, row in operating_points.iterrows():
+    ax.annotate(row['Probability'], (row['Recall_Sensitivity_TPR'], row['Specificity_TNR']))
+ax.set_xlabel('Sensitivity')
+ax.set_ylabel('Specificity')
+ax.set_title('MAT-Appendix operating-point trade-off')
+save_figure(fig, '09_operating_points')
+
+for name in ALL_MODELS:
+    matrix = confusion_matrix(y, calibration[name]['class'], labels=[0, 1])
+    fig, ax = plt.subplots(figsize=(4.8, 4.3))
+    image = ax.imshow(matrix)
+    for i in range(2):
+        for j in range(2):
+            ax.text(j, i, int(matrix[i, j]), ha='center', va='center')
+    ax.set_xticks([0, 1]); ax.set_yticks([0, 1])
+    ax.set_xticklabels(['Uncomplicated', 'Complicated'])
+    ax.set_yticklabels(['Uncomplicated', 'Complicated'])
+    ax.set_xlabel('Predicted')
+    ax.set_ylabel('Actual')
+    ax.set_title(f'Confusion matrix: {name}')
+    fig.colorbar(image, ax=ax)
+    save_figure(fig, '10_confusion_' + name.replace(' ', '_').replace('-', '_'))
+
+fig, ax = plt.subplots(figsize=(9, 6))
+plot_perm = permutation.head(20).sort_values('mean')
+ax.barh(plot_perm['Feature'], plot_perm['mean'], xerr=plot_perm['std'].fillna(0))
+ax.set_xlabel('OOF PR-AUC decrease')
+ax.set_title('Fold-aggregated permutation importance')
+save_figure(fig, '20_permutation_importance')
+
+if xai_status.get('SHAP') == 'completed' and not aggregated.empty:
+    plot_shap = aggregated.head(20).sort_values('MeanAbsSHAP_Total')
+    fig, ax = plt.subplots(figsize=(9, 6))
+    ax.barh(plot_shap['Feature'], plot_shap['MeanAbsSHAP_Value'], label='Value contribution')
+    ax.barh(
+        plot_shap['Feature'],
+        plot_shap['MeanAbsSHAP_Missing'],
+        left=plot_shap['MeanAbsSHAP_Value'],
+        label='Missingness contribution',
+    )
+    ax.set_xlabel('Mean absolute SHAP')
+    ax.set_title('Aggregated value and missingness SHAP contributions')
+    ax.legend()
+    save_figure(fig, '21_shap_aggregated')
+
+    import shap
+    shap.summary_plot(
+        shap_payload['shap_values'],
+        shap_payload['explained_values'],
+        feature_names=expanded_names,
+        max_display=20,
+        show=False,
+    )
+    save_figure(plt.gcf(), '22_shap_beeswarm_expanded')
+
+if xai_status.get('LIME') == 'completed':
+    lime_table = pd.DataFrame(lime_payload['items'], columns=['Rule', 'Weight']).sort_values('Weight')
+    fig, ax = plt.subplots(figsize=(9, 6))
+    ax.barh(lime_table['Rule'], lime_table['Weight'])
+    ax.set_title('LIME explanation for one complicated-case prediction')
+    save_figure(fig, '23_lime_local')
+
+if not subgroup_results.empty:
+    fig, ax = plt.subplots(figsize=(10, 5))
+    subgroup_plot = subgroup_results.dropna(subset=['ROC_AUC']).copy()
+    labels = subgroup_plot['Subgroup'] + ': ' + subgroup_plot['Level']
+    ax.bar(labels, subgroup_plot['ROC_AUC'])
+    ax.axhline(roc_auc_score(y, mat_probability), linestyle='--', label='Overall MAT-Appendix')
+    ax.set_ylim(0.5, 1.0)
+    ax.set_ylabel('ROC-AUC')
+    ax.set_title('MAT-Appendix subgroup discrimination')
+    ax.tick_params(axis='x', rotation=40)
+    ax.legend()
+    save_figure(fig, '24_subgroup_roc_auc')
+
+# -----------------------------------------------------------------------------
+# 9. Reproducibility bundle, complete tables and GitHub export
+# -----------------------------------------------------------------------------
+tables = {
+    'cohort': cohort,
+    'leakage_audit': audit,
+    'missingness': missingness,
+    'fold_metrics': fold_metrics,
+    'metrics_raw': metrics_raw,
+    'metrics_primary': metrics_primary,
+    'bootstrap_ci': bootstrap_ci,
+    'calibration_bins': calibration_bins,
+    'operating_points': operating_points,
+    'paired_bootstrap': paired_bootstrap,
+    'permutation_raw': permutation_raw,
+    'permutation': permutation,
+    'shap_aggregated': aggregated,
+    'subgroup_results': subgroup_results,
+}
+for name, table in tables.items():
+    table.to_csv(OUT/'tables'/f'{name}.csv', index=False)
+
+prediction_table = pd.DataFrame({
+    'Row': np.arange(len(y)),
+    'Source_Row': source_rows,
+    'Truth': y,
+})
+for name in ALL_MODELS:
+    safe = name.replace(' ', '_').replace('-', '_')
+    prediction_table[f'{safe}_RawOOF'] = oof_raw[name]
+    prediction_table[f'{safe}_CalibratedOOF'] = calibration[name]['calibrated']
+    prediction_table[f'{safe}_PrimaryClass'] = calibration[name]['class']
+prediction_table.to_csv(OUT/'tables'/'all_oof_predictions.csv', index=False)
+
+versions = {
+    'python': platform.python_version(),
+    'numpy': np.__version__,
+    'pandas': pd.__version__,
+    'torch': torch.__version__,
+    'sklearn': __import__('sklearn').__version__,
+    'catboost': __import__('catboost').__version__,
+    'xgboost': __import__('xgboost').__version__,
+    'device': str(DEVICE),
+}
+
+bundle = {
+    'version': '2.0-conference-complete',
+    'run_id': RUN_ID,
+    'config': CFG,
+    'dataset': {
+        'uci_id': 938,
+        'cohort_definition': 'Diagnosis == appendicitis AND Severity in {complicated, uncomplicated}',
+        'sha256': data_hash,
+        'source_rows': source_rows,
+        'features': list(X.columns),
+        'target_mapping': {'uncomplicated': 0, 'complicated': 1},
+    },
+    'audit': audit.to_dict('records'),
+    'fold_splits': [
+        {'fold': index+1, 'train_idx': train.tolist(), 'test_idx': test.tolist()}
+        for index, (train, test) in enumerate(fold_splits)
+    ],
+    'models': {
+        # Proposed model states and fold preprocessors are retained for future XAI.
+        # Baseline/ablation predictions and fold metadata are retained without bulky fitted objects.
+        'proposed_mat_appendix': neural_artifacts['MAT-Appendix'],
+        'comparison_metadata': {
+            name: [
+                {
+                    'model_name': item['model_name'],
+                    'fold': item['fold'],
+                    'train_idx': item['train_idx'],
+                    'test_idx': item['test_idx'],
+                    'preprocessor': item['preprocessor'],
+                    'prediction': item['prediction'],
+                }
+                for item in (classical_artifacts[name] if name in classical_artifacts else neural_artifacts[name])
+            ]
+            for name in CLASSICAL_NAMES + ['FT-Transformer', 'MAT-NoMissingEmbedding']
+        },
+    },
+    'predictions': {
+        'y': y,
+        'raw_oof': {name: probability.astype(np.float32) for name, probability in oof_raw.items()},
+        'calibrated_oof': {name: calibration[name]['calibrated'].astype(np.float32) for name in ALL_MODELS},
+        'primary_classes': {name: calibration[name]['class'].astype(np.int8) for name in ALL_MODELS},
+    },
+    'calibration': calibration,
+    'metrics': {
+        'primary': metrics_primary.to_dict('records'),
+        'raw': metrics_raw.to_dict('records'),
+        'bootstrap_ci': bootstrap_ci.to_dict('records'),
+        'operating_points': operating_points.to_dict('records'),
+        'paired_bootstrap': paired_bootstrap.to_dict('records'),
+        'strongest_baseline': strongest_baseline,
+    },
+    'xai': {
+        'status': xai_status,
+        'permutation': permutation.to_dict('records'),
+        'shap': shap_payload,
+        'lime': lime_payload,
+    },
+    'subgroups': subgroup_results.to_dict('records'),
+    'versions': versions,
+}
+
+bundle_path = OUT/'mat_appendix_complete_reproducibility.pkl'
+joblib.dump(bundle, bundle_path, compress=5)
+
