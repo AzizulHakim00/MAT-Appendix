@@ -1,0 +1,235 @@
+
+save_json({
+    "config": asdict(CFG),
+    "config_hash": CONFIG_HASH,
+    "run_id": RUN_ID,
+    "created_utc": now_utc(),
+    "device": str(DEVICE),
+    "python": sys.version,
+    "platform": platform.platform(),
+    "torch": torch.__version__,
+    "cuda_available": torch.cuda.is_available(),
+    "cuda_device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+    "source_commit": SOURCE_COMMIT,
+    "source_sha256": SOURCE_SHA256,
+    "pretrained_backbone": USE_PRETRAINED,
+}, RUN_DIR / "config.json")
+
+try:
+    freeze = subprocess.run([sys.executable, "-m", "pip", "freeze"], check=True, capture_output=True, text=True)
+    (RUN_DIR / "environment_freeze.txt").write_text(freeze.stdout, encoding="utf-8")
+except Exception as exc:
+    print(f"⚠ Could not save pip freeze: {exc}")
+
+print(f"Run directory: {RUN_DIR}")
+
+
+# -----------------------------------------------------------------------------
+# Official data acquisition
+# -----------------------------------------------------------------------------
+ZENODO_RECORD = "7711412"
+ZENODO_BASE = f"https://zenodo.org/records/{ZENODO_RECORD}/files"
+OFFICIAL_FILES = {
+    "app_data.xlsx": (f"{ZENODO_BASE}/app_data.xlsx?download=1", "d17a803f5e27532e518676a38f588b59"),
+    "README.md": (f"{ZENODO_BASE}/README.md?download=1", "0de3b9ed4479d0b977beb2d2780cef72"),
+    "test_set_codes.csv": (f"{ZENODO_BASE}/test_set_codes.csv?download=1", "4154f6b2df56bfc8c90993532c5e0132"),
+    "US_Pictures.zip": (f"{ZENODO_BASE}/US_Pictures.zip?download=1", "38b81fd3dddaeed458132be2ec1732ed"),
+}
+
+
+def download_verified(name: str) -> Path:
+    url, expected_md5 = OFFICIAL_FILES[name]
+    dest = CACHE_ROOT / name
+    if dest.exists() and md5_file(dest) == expected_md5:
+        print(f"✓ Cached and verified: {name}")
+        return dest
+    if dest.exists():
+        dest.unlink()
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    tmp.unlink(missing_ok=True)
+    print(f"Downloading {name}...")
+    with requests.get(url, stream=True, timeout=(30, 600)) as response:
+        response.raise_for_status()
+        total = int(response.headers.get("content-length", 0))
+        with tmp.open("wb") as f, tqdm(total=total, unit="B", unit_scale=True, desc=name) as bar:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+                    bar.update(len(chunk))
+    actual = md5_file(tmp)
+    if actual != expected_md5:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"MD5 mismatch for {name}: expected {expected_md5}, got {actual}")
+    tmp.replace(dest)
+    print(f"✓ Downloaded and verified: {name}")
+    return dest
+
+
+def prepare_data_files() -> dict[str, Path]:
+    names = ["app_data.xlsx", "README.md", "test_set_codes.csv"]
+    if CFG.download_images:
+        names.append("US_Pictures.zip")
+    paths = {name: download_verified(name) for name in names}
+
+    image_root = LOCAL_EXTRACT_ROOT / "images"
+    marker = image_root / ".extraction_complete"
+    if CFG.download_images and not marker.exists():
+        if image_root.exists():
+            shutil.rmtree(image_root)
+        image_root.mkdir(parents=True, exist_ok=True)
+        print("Extracting ultrasound archive to local runtime storage...")
+        with zipfile.ZipFile(paths["US_Pictures.zip"], "r") as archive:
+            archive.extractall(image_root)
+        marker.write_text(now_utc(), encoding="utf-8")
+        print("✓ Image extraction complete")
+    paths["image_root"] = image_root
+    return paths
+
+
+DATA_PATHS = prepare_data_files()
+
+
+# -----------------------------------------------------------------------------
+# Dataset audit and cohort construction
+# -----------------------------------------------------------------------------
+SAFE_FEATURES = [
+    "Age", "Sex", "Height", "Weight", "BMI", "Alvarado_Score",
+    "Paedriatic_Appendicitis_Score", "Peritonitis", "Migratory_Pain",
+    "Lower_Right_Abd_Pain", "Contralateral_Rebound_Tenderness",
+    "Coughing_Pain", "Psoas_Sign", "Nausea", "Loss_of_Appetite",
+    "Body_Temperature", "Dysuria", "Stool", "WBC_Count",
+    "Neutrophil_Percentage", "CRP", "Ketones_in_Urine", "RBC_in_Urine",
+    "WBC_in_Urine", "Appendix_on_US", "Appendix_Diameter", "Free_Fluids",
+    "Appendix_Wall_Layers", "Target_Sign", "Perfusion",
+    "Surrounding_Tissue_Reaction", "Pathological_Lymph_Nodes",
+    "Bowel_Wall_Thickening", "Ileus", "Coprostasis", "Meteorism",
+    "Enteritis", "Conglomerate_of_Bowel_Loops", "Gynecological_Findings",
+]
+
+# Direct label components/post-decision variables are intentionally excluded.
+LEAKAGE_DENYLIST = {
+    "Severity", "Diagnosis", "Management", "Length_of_Stay", "US_Number",
+    "Perforation", "Appendicular_Abscess", "Abscess_Location",
+}
+
+NUMERIC_FEATURES = {
+    "Age", "Height", "Weight", "BMI", "Alvarado_Score",
+    "Paedriatic_Appendicitis_Score", "Body_Temperature", "WBC_Count",
+    "Neutrophil_Percentage", "CRP", "Appendix_Diameter",
+}
+
+
+def normalize_text(value: Any) -> str:
+    if pd.isna(value):
+        return ""
+    return str(value).strip().lower().replace("_", " ")
+
+
+def parse_patient_code_from_filename(path: Path) -> str | None:
+    match = re.match(r"^(\d+)", path.stem.strip())
+    return str(int(match.group(1))) if match else None
+
+
+def audit_images(image_root: Path) -> tuple[dict[str, list[Path]], pd.DataFrame]:
+    extensions = {".bmp", ".png", ".jpg", ".jpeg", ".tif", ".tiff"}
+    image_paths = sorted(p for p in image_root.rglob("*") if p.is_file() and p.suffix.lower() in extensions)
+    mapping: dict[str, list[Path]] = {}
+    rows: list[dict[str, Any]] = []
+    for path in tqdm(image_paths, desc="Auditing ultrasound images"):
+        code = parse_patient_code_from_filename(path)
+        if code is None:
+            rows.append({"path": str(path), "patient_id": None, "valid": False,
+                         "error": "no numeric patient prefix"})
+            continue
+        try:
+            with Image.open(path) as image:
+                image.verify()
+            with Image.open(path) as image:
+                width, height = image.size
+                mode = image.mode
+            mapping.setdefault(code, []).append(path)
+            rows.append({"path": str(path), "patient_id": code, "valid": True,
+                         "width": width, "height": height, "mode": mode,
+                         "bytes": path.stat().st_size, "error": ""})
+        except Exception as exc:
+            rows.append({"path": str(path), "patient_id": code, "valid": False,
+                         "error": repr(exc)})
+    manifest = pd.DataFrame(rows)
+    return mapping, manifest
+
+
+def load_cohort() -> tuple[pd.DataFrame, list[str], dict[str, list[Path]], pd.DataFrame]:
+    df = pd.read_excel(DATA_PATHS["app_data.xlsx"], engine="openpyxl")
+    df.columns = [str(c).strip() for c in df.columns]
+    required = {"US_Number", "Diagnosis", "Severity"}
+    missing_required = required - set(df.columns)
+    if missing_required:
+        raise RuntimeError(f"Missing required dataset columns: {sorted(missing_required)}")
+
+    diagnosis = df["Diagnosis"].map(normalize_text)
+    severity = df["Severity"].map(normalize_text)
+    cohort = df.loc[
+        diagnosis.eq("appendicitis") & severity.isin({"complicated", "uncomplicated"})
+    ].copy()
+    cohort["patient_id_numeric"] = pd.to_numeric(cohort["US_Number"], errors="coerce")
+    cohort = cohort.loc[cohort["patient_id_numeric"].notna()].copy()
+    cohort["patient_id"] = cohort["patient_id_numeric"].astype(int).astype(str)
+    cohort["target"] = severity.loc[cohort.index].map({"uncomplicated": 0, "complicated": 1}).astype(int)
+    duplicated_ids = cohort.loc[cohort["patient_id"].duplicated(keep=False), "patient_id"].unique().tolist()
+    if duplicated_ids:
+        raise RuntimeError(f"Duplicate US_Number values in severity cohort: {duplicated_ids[:10]}")
+    cohort = cohort.reset_index(drop=True)
+
+    present_features = [c for c in SAFE_FEATURES if c in cohort.columns and c not in LEAKAGE_DENYLIST]
+    if len(present_features) < 25:
+        raise RuntimeError(f"Only {len(present_features)} safe features found; schema may have changed.")
+
+    for column in present_features:
+        cohort[column] = cohort[column].replace({"NULL": np.nan, "null": np.nan, "": np.nan})
+        if column in NUMERIC_FEATURES:
+            cohort[column] = pd.to_numeric(cohort[column], errors="coerce")
+
+    image_map, image_manifest = audit_images(DATA_PATHS["image_root"])
+    cohort["image_count"] = cohort["patient_id"].map(lambda x: len(image_map.get(x, [])))
+
+    codes_text = DATA_PATHS["test_set_codes.csv"].read_text(encoding="utf-8", errors="replace")
+    official_test_codes = {str(int(x)) for x in re.findall(r"\d+", codes_text)}
+    cohort["official_holdout"] = cohort["patient_id"].isin(official_test_codes)
+
+    expected_total, expected_positive = 463, 118
+    actual_signature = (len(cohort), int(cohort["target"].sum()))
+    if actual_signature != (expected_total, expected_positive):
+        raise RuntimeError(
+            "Severity cohort signature changed. "
+            f"Expected N={expected_total}, complicated={expected_positive}; "
+            f"found N={actual_signature[0]}, complicated={actual_signature[1]}."
+        )
+
+    audit = {
+        "raw_table_shape": list(df.shape),
+        "confirmed_severity_cohort": int(len(cohort)),
+        "complicated": int(cohort["target"].sum()),
+        "uncomplicated": int((cohort["target"] == 0).sum()),
+        "patients_with_images": int((cohort["image_count"] > 0).sum()),
+        "patients_without_images": int((cohort["image_count"] == 0).sum()),
+        "total_valid_images_in_archive": int(image_manifest.get("valid", pd.Series(dtype=bool)).sum()),
+        "invalid_images": int((~image_manifest.get("valid", pd.Series(dtype=bool))).sum()),
+        "official_holdout_patients_in_cohort": int(cohort["official_holdout"].sum()),
+        "safe_feature_count": len(present_features),
+        "safe_features": present_features,
+        "explicit_leakage_exclusions": sorted(LEAKAGE_DENYLIST),
+    }
+    save_json(audit, RUN_DIR / "dataset_audit.json")
+    cohort[["patient_id", "target", "image_count", "official_holdout"]].to_csv(
+        RUN_DIR / "cohort_manifest.csv", index=False
+    )
+    image_manifest.to_csv(RUN_DIR / "image_manifest.csv", index=False)
+
+    print("\nDATASET AUDIT")
+    display(pd.DataFrame([audit]).T.rename(columns={0: "value"}))
+    return cohort, present_features, image_map, image_manifest
+
+
+COHORT, FEATURE_COLUMNS, IMAGE_MAP, IMAGE_MANIFEST = load_cohort()
+DEV_DF = COHORT.loc[~COHORT["official_holdout"]].reset_index(drop=True)
+HOLDOUT_DF = COHORT.loc[COHORT["official_holdout"]].reset_index(drop=True)
