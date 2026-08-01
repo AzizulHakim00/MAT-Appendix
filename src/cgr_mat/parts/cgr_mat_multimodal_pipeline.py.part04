@@ -1,0 +1,235 @@
+        base_token = self.base_encoder(base_logit.view(-1, 1))
+
+        image_available = view_mask.any(dim=1)
+        drop_image = torch.zeros(batch, dtype=torch.bool, device=images.device)
+        drop_tabular = torch.zeros(batch, dtype=torch.bool, device=images.device)
+        if self.training and CFG.modality_dropout > 0:
+            drop_image = (torch.rand(batch, device=images.device) < CFG.modality_dropout) & image_available
+            drop_tabular = torch.rand(batch, device=images.device) < CFG.modality_dropout
+        image_token = image_token * (~drop_image).float().unsqueeze(1)
+        tabular_token = tabular_token * (~drop_tabular).float().unsqueeze(1)
+        missing = torch.stack((~image_available | drop_image, drop_tabular), dim=1).float()
+        missing_token = self.missing_encoder(missing)
+
+        cls = self.cls_token.expand(batch, -1, -1)
+        tokens = torch.stack((image_token, tabular_token, base_token, missing_token), dim=1)
+        encoded = self.transformer(torch.cat((cls, tokens), dim=1))
+        fused = encoded[:, 0]
+        residual = self.residual_head(fused).squeeze(1)
+        gate = self.gate_head(fused).squeeze(1)
+        final_logit = base_logit + gate * residual
+        return {
+            "logit": final_logit,
+            "residual": residual,
+            "gate": gate,
+            "attention": attention,
+        }
+
+
+def build_optimizer(model: CGRMAT) -> torch.optim.Optimizer:
+    backbone_params = list(model.backbone.parameters())
+    head_params = [p for name, p in model.named_parameters() if not name.startswith("backbone.")]
+    return torch.optim.AdamW([
+        {"params": backbone_params, "lr": CFG.learning_rate * CFG.backbone_lr_multiplier},
+        {"params": head_params, "lr": CFG.learning_rate},
+    ], weight_decay=CFG.weight_decay)
+
+
+# -----------------------------------------------------------------------------
+# Metrics and visualisation
+# -----------------------------------------------------------------------------
+def classification_metrics(y_true: np.ndarray, prob: np.ndarray, threshold: float = 0.5) -> dict[str, float | int]:
+    y_true = np.asarray(y_true, dtype=int)
+    prob = np.clip(np.asarray(prob, dtype=float), 1e-7, 1 - 1e-7)
+    pred = (prob >= threshold).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_true, pred, labels=[0, 1]).ravel()
+    specificity = tn / max(tn + fp, 1)
+    npv = tn / max(tn + fn, 1)
+    return {
+        "threshold": float(threshold),
+        "accuracy": accuracy_score(y_true, pred),
+        "balanced_accuracy": balanced_accuracy_score(y_true, pred),
+        "precision": precision_score(y_true, pred, zero_division=0),
+        "sensitivity": recall_score(y_true, pred, zero_division=0),
+        "specificity": specificity,
+        "npv": npv,
+        "f1": f1_score(y_true, pred, zero_division=0),
+        "f2": fbeta_score(y_true, pred, beta=2, zero_division=0),
+        "mcc": matthews_corrcoef(y_true, pred),
+        "roc_auc": roc_auc_score(y_true, prob),
+        "pr_auc": average_precision_score(y_true, prob),
+        "brier": brier_score_loss(y_true, prob),
+        "log_loss": log_loss(y_true, prob, labels=[0, 1]),
+        "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp),
+    }
+
+
+def choose_operating_threshold(y_true: np.ndarray, prob: np.ndarray) -> tuple[float, pd.DataFrame]:
+    rows = []
+    for threshold in np.linspace(0.02, 0.98, 481):
+        metrics = classification_metrics(y_true, prob, float(threshold))
+        rows.append(metrics)
+    table = pd.DataFrame(rows)
+    eligible = table.loc[table["sensitivity"] >= CFG.min_sensitivity]
+    if eligible.empty:
+        best = table.sort_values(["balanced_accuracy", "mcc"], ascending=False).iloc[0]
+    else:
+        best = eligible.sort_values(["balanced_accuracy", "specificity", "mcc"], ascending=False).iloc[0]
+    return float(best["threshold"]), table
+
+
+def fit_temperature(logits: np.ndarray, labels: np.ndarray) -> float:
+    logits = np.asarray(logits, dtype=float)
+    labels = np.asarray(labels, dtype=float)
+
+    def objective(log_temperature: np.ndarray) -> float:
+        temperature = float(np.exp(log_temperature[0]))
+        prob = sigmoid_np(logits / temperature)
+        return log_loss(labels, prob, labels=[0, 1])
+
+    result = minimize(objective, x0=np.array([0.0]), method="Nelder-Mead")
+    return float(np.exp(result.x[0]))
+
+
+def plot_training_history(history: pd.DataFrame, path: Path, title: str) -> None:
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.plot(history["epoch"], history["train_loss"], label="Train loss")
+    ax.plot(history["epoch"], history["val_loss"], label="Validation loss")
+    ax2 = ax.twinx()
+    ax2.plot(history["epoch"], history["val_roc_auc"], linestyle="--", label="Validation ROC-AUC")
+    ax2.plot(history["epoch"], history["val_pr_auc"], linestyle=":", label="Validation PR-AUC")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax2.set_ylabel("AUC")
+    ax.set_title(title)
+    lines = ax.get_lines() + ax2.get_lines()
+    ax.legend(lines, [line.get_label() for line in lines], loc="best")
+    fig.tight_layout()
+    fig.savefig(path, dpi=220, bbox_inches="tight")
+    plt.show()
+    plt.close(fig)
+
+
+def plot_final_results(
+    y_true: np.ndarray,
+    base_prob: np.ndarray,
+    proposed_prob: np.ndarray,
+    threshold: float,
+    out_dir: Path,
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    for name, prob in [("Tabular base", base_prob), ("CGR-MAT", proposed_prob)]:
+        fpr, tpr, _ = roc_curve(y_true, prob)
+        ax.plot(fpr, tpr, label=f"{name} (AUC={roc_auc_score(y_true, prob):.3f})")
+    ax.plot([0, 1], [0, 1], linestyle="--")
+    ax.set_xlabel("False-positive rate")
+    ax.set_ylabel("True-positive rate")
+    ax.set_title("Official holdout ROC curves")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_dir / "holdout_roc.png", dpi=240, bbox_inches="tight")
+    plt.show(); plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    for name, prob in [("Tabular base", base_prob), ("CGR-MAT", proposed_prob)]:
+        precision, recall, _ = precision_recall_curve(y_true, prob)
+        ax.plot(recall, precision, label=f"{name} (AP={average_precision_score(y_true, prob):.3f})")
+    ax.set_xlabel("Recall")
+    ax.set_ylabel("Precision")
+    ax.set_title("Official holdout precision-recall curves")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_dir / "holdout_pr.png", dpi=240, bbox_inches="tight")
+    plt.show(); plt.close(fig)
+
+    pred = (proposed_prob >= threshold).astype(int)
+    cm = confusion_matrix(y_true, pred, labels=[0, 1])
+    fig, ax = plt.subplots(figsize=(5.5, 5))
+    image = ax.imshow(cm)
+    for i in range(2):
+        for j in range(2):
+            ax.text(j, i, str(cm[i, j]), ha="center", va="center", fontsize=15)
+    ax.set_xticks([0, 1], labels=["Uncomplicated", "Complicated"])
+    ax.set_yticks([0, 1], labels=["Uncomplicated", "Complicated"])
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    ax.set_title(f"CGR-MAT confusion matrix (threshold={threshold:.3f})")
+    fig.colorbar(image, ax=ax)
+    fig.tight_layout()
+    fig.savefig(out_dir / "holdout_confusion_matrix.png", dpi=240, bbox_inches="tight")
+    plt.show(); plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    for name, prob in [("Tabular base", base_prob), ("CGR-MAT", proposed_prob)]:
+        frac, mean = calibration_curve(y_true, prob, n_bins=8, strategy="quantile")
+        ax.plot(mean, frac, marker="o", label=name)
+    ax.plot([0, 1], [0, 1], linestyle="--")
+    ax.set_xlabel("Mean predicted probability")
+    ax.set_ylabel("Observed fraction positive")
+    ax.set_title("Official holdout calibration")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_dir / "holdout_calibration.png", dpi=240, bbox_inches="tight")
+    plt.show(); plt.close(fig)
+
+
+# -----------------------------------------------------------------------------
+# Training and inference
+# -----------------------------------------------------------------------------
+def move_batch(batch: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **batch,
+        "images": batch["images"].to(DEVICE, non_blocking=True),
+        "view_mask": batch["view_mask"].to(DEVICE, non_blocking=True),
+        "tabular": batch["tabular"].to(DEVICE, non_blocking=True),
+        "base_logit": batch["base_logit"].to(DEVICE, non_blocking=True),
+        "label": batch["label"].to(DEVICE, non_blocking=True),
+    }
+
+
+@torch.no_grad()
+def predict_loader(model: CGRMAT, loader: DataLoader) -> pd.DataFrame:
+    model.eval()
+    rows: list[dict[str, Any]] = []
+    for batch in loader:
+        raw_batch = batch
+        batch = move_batch(batch)
+        with torch.autocast(device_type=DEVICE.type, enabled=CFG.amp and DEVICE.type == "cuda"):
+            out = model(batch["images"], batch["view_mask"], batch["tabular"], batch["base_logit"])
+        logits = out["logit"].detach().cpu().numpy()
+        probs = sigmoid_np(logits)
+        attention = out["attention"].detach().cpu().numpy()
+        gate = out["gate"].detach().cpu().numpy()
+        residual = out["residual"].detach().cpu().numpy()
+        labels = batch["label"].detach().cpu().numpy().astype(int)
+        base_logits = batch["base_logit"].detach().cpu().numpy()
+        for i, patient_id in enumerate(raw_batch["patient_id"]):
+            valid_attention = attention[i][attention[i] > 0]
+            rows.append({
+                "patient_id": str(patient_id),
+                "label": int(labels[i]),
+                "base_logit": float(base_logits[i]),
+                "base_probability": float(sigmoid_np(base_logits[i])),
+                "proposed_logit": float(logits[i]),
+                "proposed_probability": float(probs[i]),
+                "residual": float(residual[i]),
+                "gate": float(gate[i]),
+                "attention_max": float(valid_attention.max()) if len(valid_attention) else 0.0,
+                "attention_entropy": float(-(valid_attention * np.log(valid_attention + 1e-12)).sum()) if len(valid_attention) else 0.0,
+                "image_count": int(raw_batch["image_count"][i]),
+            })
+    return pd.DataFrame(rows)
+
+
+def _make_loader(dataset: Dataset, shuffle: bool, seed: int) -> DataLoader:
+    generator = torch.Generator().manual_seed(seed)
+    return DataLoader(
+        dataset,
+        batch_size=CFG.batch_size,
+        shuffle=shuffle,
+        generator=generator if shuffle else None,
+        num_workers=CFG.num_workers,
+        pin_memory=DEVICE.type == "cuda",
+        persistent_workers=CFG.num_workers > 0,
