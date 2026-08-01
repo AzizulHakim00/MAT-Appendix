@@ -1,0 +1,231 @@
+        print(f"Results directory: {RUN_DIR}")
+        return
+    print("\n" + "=" * 84)
+    print("CGR-MAT MULTIMODAL SEVERITY PIPELINE")
+    print("Patient-level official holdout + leakage-safe development CV")
+    print("=" * 84)
+
+    y_dev = DEV_DF["target"].to_numpy(dtype=int)
+    splitter = StratifiedKFold(n_splits=CFG.outer_folds, shuffle=True, random_state=CFG.seed)
+    oof_rows: list[pd.DataFrame] = []
+    fold_metric_rows: list[dict[str, Any]] = []
+    best_epochs: list[int] = []
+    base_oof_prob = np.full(len(DEV_DF), np.nan, dtype=float)
+
+    for fold, (train_idx, val_idx) in enumerate(splitter.split(DEV_DF, y_dev), start=1):
+        fold_dir = RUN_DIR / "folds" / f"fold_{fold}"
+        completed_file = fold_dir / "COMPLETED.json"
+        print("\n" + "-" * 84)
+        print(f"OUTER FOLD {fold}/{CFG.outer_folds}")
+        print("-" * 84)
+        if completed_file.exists() and not CFG.force_restart:
+            completed = json.loads(completed_file.read_text(encoding="utf-8"))
+            predictions = pd.read_csv(fold_dir / "predictions.csv")
+            predictions["fold"] = fold
+            predictions["dev_position"] = val_idx
+            oof_rows.append(predictions)
+            fold_metric_rows.append(completed["metrics"])
+            best_epochs.append(int(completed["best_epoch"]))
+            base_oof_prob[val_idx] = predictions["base_probability"].to_numpy()
+            print("✓ Resumed completed fold")
+            continue
+
+        train_frame = DEV_DF.iloc[train_idx].reset_index(drop=True)
+        val_frame = DEV_DF.iloc[val_idx].reset_index(drop=True)
+        base_train_prob, base_val_prob, preprocessor, base_model, train_tab, val_tab = inner_oof_base(
+            train_frame, val_frame, CFG.seed + fold * 1000
+        )
+        train_base_logits = safe_logit(base_train_prob).astype(np.float32)
+        val_base_logits = safe_logit(base_val_prob).astype(np.float32)
+        base_oof_prob[val_idx] = base_val_prob
+
+        fold_dir.mkdir(parents=True, exist_ok=True)
+        joblib.dump(preprocessor, fold_dir / "preprocessor.pkl")
+        joblib.dump(base_model, fold_dir / "tabular_base_model.pkl")
+        base_model.save_model(str(fold_dir / "tabular_base_model.cbm"))
+        np.save(fold_dir / "train_indices.npy", train_idx)
+        np.save(fold_dir / "validation_indices.npy", val_idx)
+
+        predictions, history, best_epoch = train_fold(
+            fold, train_frame, val_frame, train_tab, val_tab,
+            train_base_logits, val_base_logits, fold_dir
+        )
+        predictions["fold"] = fold
+        predictions["dev_position"] = val_idx
+        predictions.to_csv(fold_dir / "predictions.csv", index=False)
+        metrics = classification_metrics(
+            predictions["label"].to_numpy(), predictions["proposed_probability"].to_numpy(), 0.5
+        )
+        metrics.update({"fold": fold, "n_validation": len(val_frame), "best_epoch": best_epoch})
+        fold_metric_rows.append(metrics)
+        best_epochs.append(best_epoch)
+        oof_rows.append(predictions)
+        save_json({"fold": fold, "best_epoch": best_epoch, "metrics": metrics, "completed_utc": now_utc()}, completed_file)
+
+        print("Fold result:")
+        display(pd.DataFrame([metrics]))
+
+    oof = pd.concat(oof_rows, ignore_index=True).sort_values("dev_position").reset_index(drop=True)
+    if not np.array_equal(oof["dev_position"].to_numpy(), np.arange(len(DEV_DF))):
+        raise RuntimeError("OOF coverage failure: development positions are missing or duplicated.")
+    oof.to_csv(RUN_DIR / "oof_predictions.csv", index=False)
+    fold_metrics = pd.DataFrame(fold_metric_rows).sort_values("fold")
+    fold_metrics.to_csv(RUN_DIR / "fold_metrics.csv", index=False)
+
+    metric_cols = [
+        "accuracy", "balanced_accuracy", "precision", "sensitivity", "specificity", "npv",
+        "f1", "f2", "mcc", "roc_auc", "pr_auc", "brier", "log_loss",
+    ]
+    summary = pd.DataFrame({
+        "metric": metric_cols,
+        "mean": [fold_metrics[c].mean() for c in metric_cols],
+        "std": [fold_metrics[c].std(ddof=1) for c in metric_cols],
+        "min": [fold_metrics[c].min() for c in metric_cols],
+        "max": [fold_metrics[c].max() for c in metric_cols],
+    })
+    summary.to_csv(RUN_DIR / "cv_summary_mean_std.csv", index=False)
+    print("\nREPEATED-FREE OUTER CV SUMMARY (one prespecified 5-fold run)")
+    display(summary)
+
+    # Calibration and operating threshold are fitted only on honest development OOF predictions.
+    oof_logits = oof["proposed_logit"].to_numpy()
+    temperature = fit_temperature(oof_logits, y_dev)
+    oof_calibrated = sigmoid_np(oof_logits / temperature)
+    threshold, threshold_table = choose_operating_threshold(y_dev, oof_calibrated)
+    threshold_table.to_csv(RUN_DIR / "development_threshold_curve.csv", index=False)
+    save_json({"temperature": temperature}, RUN_DIR / "temperature.json")
+    save_json({"threshold": threshold, "minimum_sensitivity_constraint": CFG.min_sensitivity}, RUN_DIR / "operating_threshold.json")
+    with (RUN_DIR / "temperature_scaler.pkl").open("wb") as f:
+        pickle.dump({"temperature": temperature}, f)
+
+    oof["calibrated_probability"] = oof_calibrated
+    oof.to_csv(RUN_DIR / "oof_predictions.csv", index=False)
+    oof_metrics_05 = classification_metrics(y_dev, oof_calibrated, 0.5)
+    oof_metrics_selected = classification_metrics(y_dev, oof_calibrated, threshold)
+    save_json({"fixed_0.5": oof_metrics_05, "selected_operating_point": oof_metrics_selected},
+              RUN_DIR / "development_oof_metrics.json")
+
+    # Final full-development base expert and transformed matrices.
+    final_preprocessor = make_preprocessor(DEV_DF)
+    x_dev = final_preprocessor.fit_transform(DEV_DF[FEATURE_COLUMNS]).astype(np.float32)
+    x_holdout = final_preprocessor.transform(HOLDOUT_DF[FEATURE_COLUMNS]).astype(np.float32)
+    final_base_model = fit_catboost_model(x_dev, y_dev, CFG.seed + 9000)
+    holdout_base_prob = final_base_model.predict_proba(x_holdout)[:, 1]
+    holdout_base_logits = safe_logit(holdout_base_prob).astype(np.float32)
+
+    joblib.dump(final_preprocessor, RUN_DIR / "final_preprocessor.pkl")
+    joblib.dump(final_base_model, RUN_DIR / "final_tabular_base_model.pkl")
+    final_base_model.save_model(str(RUN_DIR / "final_tabular_base_model.cbm"))
+
+    # Use honest outer-fold base predictions as training inputs to the final residual model.
+    if np.isnan(base_oof_prob).any():
+        raise RuntimeError("Base-expert OOF predictions are incomplete.")
+    final_epochs = max(CFG.final_epoch_floor, int(round(np.median(best_epochs))))
+    final_model_path = RUN_DIR / "final_cgr_mat_model.pt"
+    final_model = train_final_model(
+        DEV_DF, x_dev, safe_logit(base_oof_prob).astype(np.float32),
+        final_epochs, final_model_path
+    )
+
+    holdout_dataset = PatientMultimodalDataset(
+        HOLDOUT_DF, x_holdout, holdout_base_logits, train=False
+    )
+    holdout_loader = DataLoader(
+        holdout_dataset, batch_size=CFG.batch_size, shuffle=False,
+        num_workers=CFG.num_workers, pin_memory=DEVICE.type == "cuda",
+        persistent_workers=CFG.num_workers > 0,
+    )
+    holdout_predictions = predict_loader(final_model, holdout_loader)
+    holdout_predictions["calibrated_probability"] = sigmoid_np(
+        holdout_predictions["proposed_logit"].to_numpy() / temperature
+    )
+    holdout_predictions["prediction_0_5"] = (holdout_predictions["calibrated_probability"] >= 0.5).astype(int)
+    holdout_predictions["prediction_operating"] = (
+        holdout_predictions["calibrated_probability"] >= threshold
+    ).astype(int)
+    holdout_predictions.to_csv(RUN_DIR / "official_holdout_predictions.csv", index=False)
+
+    y_holdout = holdout_predictions["label"].to_numpy()
+    proposed_prob = holdout_predictions["calibrated_probability"].to_numpy()
+    base_prob = holdout_predictions["base_probability"].to_numpy()
+    base_metrics = classification_metrics(y_holdout, base_prob, 0.5)
+    proposed_05 = classification_metrics(y_holdout, proposed_prob, 0.5)
+    proposed_selected = classification_metrics(y_holdout, proposed_prob, threshold)
+
+    final_results = pd.DataFrame([
+        {"model": "Tabular CatBoost base", **base_metrics},
+        {"model": "CGR-MAT calibrated, threshold 0.5", **proposed_05},
+        {"model": "CGR-MAT calibrated, OOF-selected threshold", **proposed_selected},
+    ])
+    final_results.to_csv(RUN_DIR / "official_holdout_metrics.csv", index=False)
+    save_json({
+        "tabular_base": base_metrics,
+        "cgr_mat_fixed_0_5": proposed_05,
+        "cgr_mat_oof_selected_threshold": proposed_selected,
+        "temperature": temperature,
+        "selected_threshold": threshold,
+        "final_training_epochs": final_epochs,
+    }, RUN_DIR / "official_holdout_metrics.json")
+
+    # Base feature importance (interpretable tabular reference).
+    try:
+        feature_names = final_preprocessor.get_feature_names_out()
+        importance = final_base_model.get_feature_importance()
+        importance_df = pd.DataFrame({"feature": feature_names, "importance": importance}).sort_values(
+            "importance", ascending=False
+        )
+        importance_df.to_csv(RUN_DIR / "tabular_feature_importance.csv", index=False)
+        top = importance_df.head(25).sort_values("importance")
+        fig, ax = plt.subplots(figsize=(9, 8))
+        ax.barh(top["feature"], top["importance"])
+        ax.set_title("Top 25 CatBoost base-expert feature importances")
+        fig.tight_layout()
+        fig.savefig(RUN_DIR / "tabular_feature_importance.png", dpi=230, bbox_inches="tight")
+        plt.show(); plt.close(fig)
+    except Exception as exc:
+        print(f"⚠ Feature-importance export skipped: {exc}")
+
+    print("\nOFFICIAL HOLDOUT RESULTS")
+    display(final_results)
+    plot_final_results(y_holdout, base_prob, proposed_prob, threshold, RUN_DIR)
+
+    # Reproducibility bundle and checksums.
+    bundle = {
+        "run_id": RUN_ID,
+        "config": asdict(CFG),
+        "feature_columns": FEATURE_COLUMNS,
+        "development_patient_ids": DEV_DF["patient_id"].tolist(),
+        "holdout_patient_ids": HOLDOUT_DF["patient_id"].tolist(),
+        "temperature": temperature,
+        "operating_threshold": threshold,
+        "cv_summary": summary.to_dict(orient="records"),
+        "official_holdout_results": final_results.to_dict(orient="records"),
+        "source_dataset": {
+            "zenodo_record": ZENODO_RECORD,
+            "file_md5": {name: OFFICIAL_FILES[name][1] for name in OFFICIAL_FILES},
+        },
+    }
+    with (RUN_DIR / "reproducibility_bundle.pkl").open("wb") as f:
+        pickle.dump(bundle, f)
+
+    manifest_rows = []
+    for path in sorted(p for p in RUN_DIR.rglob("*") if p.is_file() and p.name != "manifest_sha256.csv"):
+        manifest_rows.append({
+            "path": str(path.relative_to(RUN_DIR)),
+            "bytes": path.stat().st_size,
+            "sha256": sha256_file(path),
+        })
+    pd.DataFrame(manifest_rows).to_csv(RUN_DIR / "manifest_sha256.csv", index=False)
+
+    archive_path = Path(shutil.make_archive(str(RUN_DIR), "zip", root_dir=RUN_DIR))
+    print("\n" + "=" * 84)
+    print("PIPELINE COMPLETE")
+    print("=" * 84)
+    print(f"Results directory: {RUN_DIR}")
+    print(f"Downloadable ZIP:  {archive_path}")
+    print("Saved: .pt, .pkl, .cbm, .csv, .json and publication-quality .png files")
+    print("Primary scientific result is the untouched official holdout table above.")
+
+
+if __name__ == "__main__":
+    run_pipeline()
