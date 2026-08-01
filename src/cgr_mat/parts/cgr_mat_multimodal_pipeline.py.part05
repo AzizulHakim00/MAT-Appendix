@@ -1,0 +1,235 @@
+    )
+
+
+def _run_train_epoch(
+    model: CGRMAT,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    criterion: nn.Module,
+    scaler: torch.cuda.amp.GradScaler,
+    description: str,
+) -> float:
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    total_loss, seen = 0.0, 0
+    progress = tqdm(loader, desc=description, leave=False)
+    for step, batch in enumerate(progress, start=1):
+        batch = move_batch(batch)
+        with torch.autocast(device_type=DEVICE.type, enabled=CFG.amp and DEVICE.type == "cuda"):
+            out = model(batch["images"], batch["view_mask"], batch["tabular"], batch["base_logit"])
+            loss = criterion(out["logit"], batch["label"]) / CFG.grad_accum_steps
+        scaler.scale(loss).backward()
+        if step % CFG.grad_accum_steps == 0 or step == len(loader):
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+        batch_size = batch["label"].shape[0]
+        total_loss += float(loss.item()) * CFG.grad_accum_steps * batch_size
+        seen += batch_size
+        progress.set_postfix(loss=total_loss / max(seen, 1))
+    return total_loss / max(seen, 1)
+
+
+def train_fold(
+    fold: int,
+    train_frame: pd.DataFrame,
+    val_frame: pd.DataFrame,
+    train_tab: np.ndarray,
+    val_tab: np.ndarray,
+    train_base_logits: np.ndarray,
+    val_base_logits: np.ndarray,
+    fold_dir: Path,
+) -> tuple[pd.DataFrame, pd.DataFrame, int]:
+    """Select epoch on an inner training-only monitor split, retrain on the
+    complete outer-training fold, and touch the outer validation fold once.
+    """
+    fold_dir.mkdir(parents=True, exist_ok=True)
+    y_train = train_frame["target"].to_numpy(dtype=int)
+    monitor_split = StratifiedShuffleSplit(
+        n_splits=1, test_size=0.16, random_state=CFG.seed + fold * 17
+    )
+    fit_idx, monitor_idx = next(monitor_split.split(train_frame, y_train))
+    fit_frame = train_frame.iloc[fit_idx].reset_index(drop=True)
+    monitor_frame = train_frame.iloc[monitor_idx].reset_index(drop=True)
+    fit_dataset = PatientMultimodalDataset(
+        fit_frame, train_tab[fit_idx], train_base_logits[fit_idx], train=True
+    )
+    monitor_dataset = PatientMultimodalDataset(
+        monitor_frame, train_tab[monitor_idx], train_base_logits[monitor_idx], train=False
+    )
+    fit_loader = _make_loader(fit_dataset, shuffle=True, seed=CFG.seed + fold)
+    monitor_loader = _make_loader(monitor_dataset, shuffle=False, seed=CFG.seed + fold)
+
+    selector = CGRMAT(train_tab.shape[1]).to(DEVICE)
+    selector.set_backbone_trainable(False)
+    optimizer = build_optimizer(selector)
+    pos = float(fit_frame["target"].sum())
+    neg = float(len(fit_frame) - pos)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(neg / max(pos, 1), device=DEVICE))
+    scaler = torch.cuda.amp.GradScaler(enabled=CFG.amp and DEVICE.type == "cuda")
+
+    best_score = -np.inf
+    best_epoch = 1
+    no_improve = 0
+    history_rows: list[dict[str, Any]] = []
+    selection_checkpoint = fold_dir / "epoch_selection_model.pt"
+
+    for epoch in range(1, CFG.max_epochs + 1):
+        if epoch == CFG.freeze_backbone_epochs + 1:
+            selector.set_backbone_trainable(True)
+            print(f"Fold {fold}: selector backbone unfrozen at epoch {epoch}")
+        train_loss = _run_train_epoch(
+            selector, fit_loader, optimizer, criterion, scaler,
+            f"Fold {fold} epoch selection {epoch}/{CFG.max_epochs}",
+        )
+        monitor_predictions = predict_loader(selector, monitor_loader)
+        monitor_prob = monitor_predictions["proposed_probability"].to_numpy()
+        monitor_y = monitor_predictions["label"].to_numpy()
+        monitor_metrics = classification_metrics(monitor_y, monitor_prob, 0.5)
+        monitor_loss = log_loss(monitor_y, np.clip(monitor_prob, 1e-7, 1 - 1e-7), labels=[0, 1])
+        score = 0.5 * monitor_metrics["roc_auc"] + 0.5 * monitor_metrics["pr_auc"]
+        history_rows.append({
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_loss": monitor_loss,
+            "val_roc_auc": monitor_metrics["roc_auc"],
+            "val_pr_auc": monitor_metrics["pr_auc"],
+            "val_balanced_accuracy": monitor_metrics["balanced_accuracy"],
+            "score": score,
+        })
+        print(
+            f"Fold {fold} | epoch {epoch:02d} | monitor only | loss {train_loss:.4f} | "
+            f"ROC {monitor_metrics['roc_auc']:.4f} | PR {monitor_metrics['pr_auc']:.4f}"
+        )
+        if score > best_score + 1e-4:
+            best_score = score
+            best_epoch = epoch
+            no_improve = 0
+            torch.save({"model_state": selector.state_dict(), "best_epoch": best_epoch}, selection_checkpoint)
+        else:
+            no_improve += 1
+            if no_improve >= CFG.patience:
+                break
+
+    history = pd.DataFrame(history_rows)
+    history.to_csv(fold_dir / "epoch_selection_history.csv", index=False)
+    plot_training_history(history, fold_dir / "epoch_selection_curves.png", f"Fold {fold}: training-only epoch selection")
+
+    # The outer validation fold has not been used above. Reinitialize and fit the
+    # fold model on every outer-training patient for the selected epoch count.
+    del selector, optimizer, fit_loader, monitor_loader, fit_dataset, monitor_dataset
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    full_dataset = PatientMultimodalDataset(train_frame, train_tab, train_base_logits, train=True)
+    outer_val_dataset = PatientMultimodalDataset(val_frame, val_tab, val_base_logits, train=False)
+    full_loader = _make_loader(full_dataset, shuffle=True, seed=CFG.seed + fold * 101)
+    outer_val_loader = _make_loader(outer_val_dataset, shuffle=False, seed=CFG.seed + fold)
+    model = CGRMAT(train_tab.shape[1]).to(DEVICE)
+    model.set_backbone_trainable(False)
+    optimizer = build_optimizer(model)
+    pos = float(train_frame["target"].sum())
+    neg = float(len(train_frame) - pos)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(neg / max(pos, 1), device=DEVICE))
+    scaler = torch.cuda.amp.GradScaler(enabled=CFG.amp and DEVICE.type == "cuda")
+    refit_rows = []
+    for epoch in range(1, best_epoch + 1):
+        if epoch == CFG.freeze_backbone_epochs + 1:
+            model.set_backbone_trainable(True)
+        train_loss = _run_train_epoch(
+            model, full_loader, optimizer, criterion, scaler,
+            f"Fold {fold} honest refit {epoch}/{best_epoch}",
+        )
+        refit_rows.append({"epoch": epoch, "train_loss": train_loss})
+        print(f"Fold {fold} honest refit | epoch {epoch:02d} | train loss {train_loss:.4f}")
+
+    checkpoint_path = fold_dir / "model_best.pt"
+    torch.save({
+        "model_state": model.state_dict(),
+        "tabular_dim": train_tab.shape[1],
+        "config": asdict(CFG),
+        "selected_epoch": best_epoch,
+        "selection_score": best_score,
+        "outer_validation_was_untouched_during_selection": True,
+    }, checkpoint_path)
+    pd.DataFrame(refit_rows).to_csv(fold_dir / "honest_refit_history.csv", index=False)
+
+    predictions = predict_loader(model, outer_val_loader)
+    predictions.to_csv(fold_dir / "predictions.csv", index=False)
+    metrics = classification_metrics(
+        predictions["label"].to_numpy(), predictions["proposed_probability"].to_numpy(), 0.5
+    )
+    save_json(metrics, fold_dir / "metrics.json")
+
+    del model, optimizer, full_loader, outer_val_loader, full_dataset, outer_val_dataset
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return predictions, history, best_epoch
+
+def train_final_model(
+    train_frame: pd.DataFrame,
+    train_tab: np.ndarray,
+    train_base_logits: np.ndarray,
+    epochs: int,
+    output_path: Path,
+) -> CGRMAT:
+    dataset = PatientMultimodalDataset(train_frame, train_tab, train_base_logits, train=True)
+    loader = DataLoader(
+        dataset, batch_size=CFG.batch_size, shuffle=True,
+        num_workers=CFG.num_workers, pin_memory=DEVICE.type == "cuda",
+        persistent_workers=CFG.num_workers > 0,
+    )
+    model = CGRMAT(train_tab.shape[1]).to(DEVICE)
+    model.set_backbone_trainable(False)
+    optimizer = build_optimizer(model)
+    pos = float(train_frame["target"].sum())
+    neg = float(len(train_frame) - pos)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(neg / max(pos, 1), device=DEVICE))
+    scaler = torch.cuda.amp.GradScaler(enabled=CFG.amp and DEVICE.type == "cuda")
+    history_rows = []
+    for epoch in range(1, epochs + 1):
+        if epoch == CFG.freeze_backbone_epochs + 1:
+            model.set_backbone_trainable(True)
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        total_loss, seen = 0.0, 0
+        for step, batch in enumerate(tqdm(loader, desc=f"Final model epoch {epoch}/{epochs}", leave=False), start=1):
+            batch = move_batch(batch)
+            with torch.autocast(device_type=DEVICE.type, enabled=CFG.amp and DEVICE.type == "cuda"):
+                out = model(batch["images"], batch["view_mask"], batch["tabular"], batch["base_logit"])
+                loss = criterion(out["logit"], batch["label"]) / CFG.grad_accum_steps
+            scaler.scale(loss).backward()
+            if step % CFG.grad_accum_steps == 0 or step == len(loader):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+            batch_size = batch["label"].shape[0]
+            total_loss += float(loss.item()) * CFG.grad_accum_steps * batch_size
+            seen += batch_size
+        epoch_loss = total_loss / max(seen, 1)
+        history_rows.append({"epoch": epoch, "train_loss": epoch_loss})
+        print(f"Final model | epoch {epoch:02d} | train loss {epoch_loss:.4f}")
+    torch.save({
+        "model_state": model.state_dict(),
+        "tabular_dim": train_tab.shape[1],
+        "config": asdict(CFG),
+        "epochs": epochs,
+    }, output_path)
+    pd.DataFrame(history_rows).to_csv(output_path.with_name("final_training_history.csv"), index=False)
+    return model
+
+
+# -----------------------------------------------------------------------------
+# Cross-validation orchestration
+# -----------------------------------------------------------------------------
+def run_pipeline() -> None:
+    completed_metrics = RUN_DIR / "official_holdout_metrics.csv"
+    if completed_metrics.exists() and not CFG.force_restart:
+        print("✓ This exact configuration is already complete. Existing official holdout results:")
+        display(pd.read_csv(completed_metrics))
