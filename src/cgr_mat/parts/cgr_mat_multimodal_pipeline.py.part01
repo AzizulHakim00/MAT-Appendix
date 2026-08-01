@@ -1,0 +1,235 @@
+from __future__ import annotations
+
+import gc
+import hashlib
+import json
+import math
+import os
+import pickle
+import platform
+import random
+import re
+import shutil
+import subprocess
+import sys
+import time
+import warnings
+import zipfile
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+import joblib
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import requests
+import torch
+import torch.nn as nn
+from IPython.display import display
+from PIL import Image
+from scipy.optimize import minimize
+from sklearn.calibration import calibration_curve
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    balanced_accuracy_score,
+    brier_score_loss,
+    confusion_matrix,
+    f1_score,
+    fbeta_score,
+    log_loss,
+    matthews_corrcoef,
+    precision_recall_curve,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+    roc_curve,
+)
+from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms as T
+from torchvision.models import ResNet18_Weights, resnet18
+from tqdm.auto import tqdm
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+try:
+    from catboost import CatBoostClassifier
+except ImportError as exc:
+    raise RuntimeError("catboost is required. Run the provided Colab notebook install cell.") from exc
+
+
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+@dataclass(frozen=True)
+class Config:
+    version: str = "CGR-MAT-v1.0"
+    seed: int = 2029
+    run_mode: str = "full"  # smoke | quick | full
+    use_drive: bool = True
+    force_restart: bool = False
+    download_images: bool = True
+
+    # Honest evaluation design
+    outer_folds: int = 5
+    inner_folds: int = 3
+    max_epochs: int = 12
+    patience: int = 4
+    final_epoch_floor: int = 4
+
+    # Imaging
+    backbone: str = "resnet18"
+    image_size: int = 224
+    max_views: int = 6
+    freeze_backbone_epochs: int = 2
+
+    # Model
+    d_model: int = 128
+    transformer_layers: int = 2
+    n_heads: int = 4
+    dropout: float = 0.20
+    modality_dropout: float = 0.18
+
+    # Optimisation
+    batch_size: int = 4
+    grad_accum_steps: int = 2
+    num_workers: int = 2
+    learning_rate: float = 2e-4
+    backbone_lr_multiplier: float = 0.10
+    weight_decay: float = 1e-4
+    amp: bool = True
+
+    # CatBoost base expert
+    cat_iterations: int = 450
+    cat_depth: int = 5
+    cat_learning_rate: float = 0.035
+
+    # Secondary operating point; selected only from development OOF predictions
+    min_sensitivity: float = 0.82
+
+    def resolved(self) -> "Config":
+        mode = self.run_mode.lower().strip()
+        if mode == "smoke":
+            return Config(**{**asdict(self), "outer_folds": 2, "inner_folds": 2,
+                             "max_epochs": 1, "patience": 1, "cat_iterations": 40,
+                             "max_views": 2, "batch_size": 2, "num_workers": 0})
+        if mode == "quick":
+            return Config(**{**asdict(self), "outer_folds": 3, "inner_folds": 2,
+                             "max_epochs": 5, "patience": 2, "cat_iterations": 220,
+                             "max_views": 4})
+        if mode != "full":
+            raise ValueError(f"Unknown run mode: {self.run_mode}")
+        return self
+
+
+RUN_MODE = os.environ.get("CGR_MAT_RUN_MODE", "full")
+USE_DRIVE = os.environ.get("CGR_MAT_USE_DRIVE", "1") == "1"
+FORCE_RESTART = os.environ.get("CGR_MAT_FORCE_RESTART", "0") == "1"
+USE_PRETRAINED = os.environ.get("CGR_MAT_PRETRAINED", "1") == "1"
+SOURCE_COMMIT = os.environ.get("CGR_MAT_SOURCE_COMMIT", "unrecorded")
+SOURCE_SHA256 = os.environ.get("CGR_MAT_SOURCE_SHA256", "unrecorded")
+CFG = Config(run_mode=RUN_MODE, use_drive=USE_DRIVE, force_restart=FORCE_RESTART).resolved()
+
+
+# -----------------------------------------------------------------------------
+# Reproducibility and utilities
+# -----------------------------------------------------------------------------
+def seed_everything(seed: int) -> None:
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def json_default(obj: Any) -> Any:
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, Path):
+        return str(obj)
+    raise TypeError(f"Cannot serialize {type(obj)}")
+
+
+def save_json(data: Any, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, default=json_default), encoding="utf-8")
+
+
+def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def md5_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    h = hashlib.md5()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def safe_logit(prob: np.ndarray | float, eps: float = 1e-6) -> np.ndarray:
+    p = np.clip(np.asarray(prob, dtype=float), eps, 1 - eps)
+    return np.log(p / (1 - p))
+
+
+def sigmoid_np(x: np.ndarray | float) -> np.ndarray:
+    x = np.asarray(x, dtype=float)
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -40, 40)))
+
+
+def now_utc() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def try_mount_drive() -> tuple[bool, Path]:
+    if not CFG.use_drive:
+        return False, Path("/content")
+    try:
+        from google.colab import drive
+        drive.mount("/content/drive", force_remount=False)
+        root = Path("/content/drive/MyDrive")
+        if root.exists():
+            print("✓ Google Drive mounted")
+            return True, root
+    except Exception as exc:
+        print(f"⚠ Drive mount failed; using /content fallback: {exc}")
+    return False, Path("/content")
+
+
+seed_everything(CFG.seed)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Device: {DEVICE}")
+if DEVICE.type != "cuda" and CFG.run_mode == "full":
+    print("⚠ Full mode is intended for a Colab GPU runtime.")
+
+DRIVE_OK, STORAGE_ROOT = try_mount_drive()
+PROJECT_ROOT = STORAGE_ROOT / "MAT-Appendix"
+CACHE_ROOT = PROJECT_ROOT / "data_cache" / "regensburg"
+RESULTS_ROOT = PROJECT_ROOT / "cgr_mat_runs"
+LOCAL_EXTRACT_ROOT = Path("/content") / "MAT_Appendix_Regensburg_Runtime"
+for p in (CACHE_ROOT, RESULTS_ROOT, LOCAL_EXTRACT_ROOT):
+    p.mkdir(parents=True, exist_ok=True)
+
+CONFIG_HASH = hashlib.sha256(
+    json.dumps(asdict(CFG), sort_keys=True).encode("utf-8")
+).hexdigest()[:12]
+RUN_ID = f"cgr_mat_v1_{CFG.run_mode}_{CONFIG_HASH}"
+RUN_DIR = RESULTS_ROOT / RUN_ID
+RUN_DIR.mkdir(parents=True, exist_ok=True)
