@@ -1,0 +1,235 @@
+
+if DEV_DF["target"].nunique() != 2 or HOLDOUT_DF["target"].nunique() != 2:
+    raise RuntimeError("Development and official holdout sets must each contain both classes.")
+
+split_table = pd.DataFrame([
+    {"split": "development", "patients": len(DEV_DF), "complicated": int(DEV_DF.target.sum()),
+     "uncomplicated": int((DEV_DF.target == 0).sum()), "with_images": int((DEV_DF.image_count > 0).sum())},
+    {"split": "official_holdout", "patients": len(HOLDOUT_DF), "complicated": int(HOLDOUT_DF.target.sum()),
+     "uncomplicated": int((HOLDOUT_DF.target == 0).sum()), "with_images": int((HOLDOUT_DF.image_count > 0).sum())},
+])
+split_table.to_csv(RUN_DIR / "split_summary.csv", index=False)
+print("\nFIXED PATIENT-LEVEL SPLIT")
+display(split_table)
+
+
+# -----------------------------------------------------------------------------
+# Leakage-safe preprocessing and CatBoost base expert
+# -----------------------------------------------------------------------------
+def make_preprocessor(frame: pd.DataFrame) -> ColumnTransformer:
+    numeric = [c for c in FEATURE_COLUMNS if c in NUMERIC_FEATURES]
+    categorical = [c for c in FEATURE_COLUMNS if c not in numeric]
+    try:
+        encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+    except TypeError:
+        encoder = OneHotEncoder(handle_unknown="ignore", sparse=False)
+    numeric_pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="median", add_indicator=True)),
+        ("scaler", StandardScaler()),
+    ])
+    categorical_pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", encoder),
+    ])
+    return ColumnTransformer([
+        ("num", numeric_pipe, numeric),
+        ("cat", categorical_pipe, categorical),
+    ], remainder="drop", verbose_feature_names_out=True)
+
+
+def fit_catboost_model(x: np.ndarray, y: np.ndarray, seed: int) -> CatBoostClassifier:
+    model = CatBoostClassifier(
+        iterations=CFG.cat_iterations,
+        depth=CFG.cat_depth,
+        learning_rate=CFG.cat_learning_rate,
+        loss_function="Logloss",
+        eval_metric="AUC",
+        auto_class_weights="Balanced",
+        random_seed=seed,
+        verbose=False,
+        allow_writing_files=False,
+        thread_count=-1,
+        l2_leaf_reg=5.0,
+        random_strength=0.5,
+    )
+    model.fit(x, y)
+    return model
+
+
+def inner_oof_base(
+    train_frame: pd.DataFrame,
+    val_frame: pd.DataFrame,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray, ColumnTransformer, CatBoostClassifier, np.ndarray, np.ndarray]:
+    y_train = train_frame["target"].to_numpy(dtype=int)
+    inner = StratifiedKFold(n_splits=CFG.inner_folds, shuffle=True, random_state=seed)
+    oof_prob = np.zeros(len(train_frame), dtype=float)
+    for inner_fold, (tr_idx, va_idx) in enumerate(inner.split(train_frame, y_train), start=1):
+        pre = make_preprocessor(train_frame.iloc[tr_idx])
+        x_tr = pre.fit_transform(train_frame.iloc[tr_idx][FEATURE_COLUMNS])
+        x_va = pre.transform(train_frame.iloc[va_idx][FEATURE_COLUMNS])
+        model = fit_catboost_model(x_tr, y_train[tr_idx], seed + inner_fold)
+        oof_prob[va_idx] = model.predict_proba(x_va)[:, 1]
+
+    full_pre = make_preprocessor(train_frame)
+    x_train_full = full_pre.fit_transform(train_frame[FEATURE_COLUMNS]).astype(np.float32)
+    x_val_full = full_pre.transform(val_frame[FEATURE_COLUMNS]).astype(np.float32)
+    full_model = fit_catboost_model(x_train_full, y_train, seed + 100)
+    val_prob = full_model.predict_proba(x_val_full)[:, 1]
+    return oof_prob, val_prob, full_pre, full_model, x_train_full, x_val_full
+
+
+# -----------------------------------------------------------------------------
+# Patient-level multimodal dataset
+# -----------------------------------------------------------------------------
+def build_transforms(train: bool) -> T.Compose:
+    if train:
+        return T.Compose([
+            T.Resize((CFG.image_size + 32, CFG.image_size + 32)),
+            T.RandomResizedCrop(CFG.image_size, scale=(0.82, 1.0), ratio=(0.95, 1.05)),
+            T.RandomRotation(10),
+            T.ColorJitter(brightness=0.15, contrast=0.15),
+            T.RandomApply([T.GaussianBlur(kernel_size=3, sigma=(0.1, 1.2))], p=0.15),
+            T.ToTensor(),
+            T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ])
+    return T.Compose([
+        T.Resize((CFG.image_size + 32, CFG.image_size + 32)),
+        T.CenterCrop(CFG.image_size),
+        T.ToTensor(),
+        T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+    ])
+
+
+class PatientMultimodalDataset(Dataset):
+    def __init__(
+        self,
+        frame: pd.DataFrame,
+        tabular: np.ndarray,
+        base_logits: np.ndarray,
+        train: bool,
+    ) -> None:
+        self.frame = frame.reset_index(drop=True)
+        self.tabular = np.asarray(tabular, dtype=np.float32)
+        self.base_logits = np.asarray(base_logits, dtype=np.float32)
+        self.train = train
+        self.transform = build_transforms(train)
+        if len(self.frame) != len(self.tabular) or len(self.frame) != len(self.base_logits):
+            raise ValueError("Frame, tabular matrix and base logits must align.")
+
+    def __len__(self) -> int:
+        return len(self.frame)
+
+    def _select_paths(self, paths: list[Path]) -> list[Path]:
+        if len(paths) <= CFG.max_views:
+            return paths
+        if self.train:
+            return random.sample(paths, CFG.max_views)
+        idx = np.linspace(0, len(paths) - 1, CFG.max_views).round().astype(int)
+        return [paths[i] for i in idx]
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        row = self.frame.iloc[index]
+        patient_id = str(row["patient_id"])
+        paths = self._select_paths(IMAGE_MAP.get(patient_id, []))
+        images = torch.zeros((CFG.max_views, 3, CFG.image_size, CFG.image_size), dtype=torch.float32)
+        view_mask = torch.zeros(CFG.max_views, dtype=torch.bool)
+        used_paths: list[str] = []
+        for j, path in enumerate(paths[:CFG.max_views]):
+            try:
+                with Image.open(path) as image:
+                    image = image.convert("RGB")
+                    images[j] = self.transform(image)
+                view_mask[j] = True
+                used_paths.append(path.name)
+            except Exception:
+                continue
+        return {
+            "images": images,
+            "view_mask": view_mask,
+            "tabular": torch.from_numpy(self.tabular[index]),
+            "base_logit": torch.tensor(self.base_logits[index], dtype=torch.float32),
+            "label": torch.tensor(int(row["target"]), dtype=torch.float32),
+            "patient_id": patient_id,
+            "image_count": int(row["image_count"]),
+            "used_paths": "|".join(used_paths),
+        }
+
+
+# -----------------------------------------------------------------------------
+# CGR-MAT core model: quality-aware multiview + residual transformer fusion
+# -----------------------------------------------------------------------------
+class QualityAwarePool(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.score = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim // 2),
+            nn.GELU(),
+            nn.Linear(dim // 2, 1),
+        )
+
+    def forward(self, features: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        scores = self.score(features).squeeze(-1)
+        scores = scores.masked_fill(~mask, -1e4)
+        weights = torch.softmax(scores, dim=1) * mask.float()
+        weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        pooled = (features * weights.unsqueeze(-1)).sum(dim=1)
+        return pooled, weights
+
+
+class CGRMAT(nn.Module):
+    def __init__(self, tabular_dim: int) -> None:
+        super().__init__()
+        if CFG.backbone != "resnet18":
+            raise ValueError(f"Unsupported backbone: {CFG.backbone}")
+        weights = ResNet18_Weights.DEFAULT if USE_PRETRAINED else None
+        self.backbone = resnet18(weights=weights)
+        image_dim = int(self.backbone.fc.in_features)
+        self.backbone.fc = nn.Identity()
+        self.quality_pool = QualityAwarePool(image_dim)
+        self.image_proj = nn.Sequential(nn.Linear(image_dim, CFG.d_model), nn.LayerNorm(CFG.d_model), nn.GELU())
+        self.tabular_encoder = nn.Sequential(
+            nn.Linear(tabular_dim, 256), nn.LayerNorm(256), nn.GELU(), nn.Dropout(CFG.dropout),
+            nn.Linear(256, CFG.d_model), nn.LayerNorm(CFG.d_model), nn.GELU(),
+        )
+        self.base_encoder = nn.Sequential(nn.Linear(1, CFG.d_model), nn.LayerNorm(CFG.d_model), nn.GELU())
+        self.missing_encoder = nn.Sequential(nn.Linear(2, CFG.d_model), nn.GELU())
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, CFG.d_model))
+        layer = nn.TransformerEncoderLayer(
+            d_model=CFG.d_model,
+            nhead=CFG.n_heads,
+            dim_feedforward=CFG.d_model * 4,
+            dropout=CFG.dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(layer, num_layers=CFG.transformer_layers)
+        self.residual_head = nn.Sequential(
+            nn.LayerNorm(CFG.d_model), nn.Linear(CFG.d_model, CFG.d_model // 2),
+            nn.GELU(), nn.Dropout(CFG.dropout), nn.Linear(CFG.d_model // 2, 1),
+        )
+        self.gate_head = nn.Sequential(
+            nn.LayerNorm(CFG.d_model), nn.Linear(CFG.d_model, CFG.d_model // 2),
+            nn.GELU(), nn.Linear(CFG.d_model // 2, 1), nn.Sigmoid(),
+        )
+        nn.init.normal_(self.cls_token, std=0.02)
+
+    def set_backbone_trainable(self, trainable: bool) -> None:
+        for param in self.backbone.parameters():
+            param.requires_grad = trainable
+
+    def forward(
+        self,
+        images: torch.Tensor,
+        view_mask: torch.Tensor,
+        tabular: torch.Tensor,
+        base_logit: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        batch, views, channels, height, width = images.shape
+        flat = images.view(batch * views, channels, height, width)
+        view_features = self.backbone(flat).view(batch, views, -1)
+        image_embedding, attention = self.quality_pool(view_features, view_mask)
+        image_token = self.image_proj(image_embedding)
+        tabular_token = self.tabular_encoder(tabular)
