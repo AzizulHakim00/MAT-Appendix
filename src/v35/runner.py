@@ -1,12 +1,11 @@
 from __future__ import annotations
 import hashlib,json
 from dataclasses import asdict
-from pathlib import Path
 import numpy as np,pandas as pd,torch
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score,average_precision_score,balanced_accuracy_score,brier_score_loss,confusion_matrix,fbeta_score,f1_score,matthews_corrcoef,precision_score,recall_score,roc_auc_score
 from sklearn.model_selection import RepeatedStratifiedKFold
-from core import CFG,Config,GLOBAL,LEVEL1,V32,VARIANTS,VERSION,availability,blend,choose_threshold,clip,engineer,load_cohort,logit,metric_row,mount_root,native,seed_all
+from core import CFG,GLOBAL,LEVEL1,V32,VARIANTS,VERSION,availability,blend,choose_threshold,clip,engineer,load_cohort,logit,metric_row,mount_root,native,seed_all
 from models import gated,level1_predictions,residuals
 
 def calibrate(a,y,b):
@@ -76,7 +75,7 @@ def main(cfg=CFG):
     X0,ys,audit=load_cohort(cfg); X=engineer(X0); y=ys.to_numpy(int); fp=hashlib.sha256(json.dumps(native(asdict(cfg)),sort_keys=True).encode()).hexdigest()[:12]; out=root/f'v35_{fp}'; out.mkdir(parents=True,exist_ok=True); audit.to_csv(out/'leakage_audit.csv',index=False)
     with open(out/'config.json','w') as f: json.dump(native({'version':VERSION,**asdict(cfg)}),f,indent=2)
     print(f'Validated cohort: N={len(X)}, positives={int(y.sum())}, negatives={int((1-y).sum())}'); print('Predictor columns after controlled engineering:',X.shape[1]); print('Output:',out)
-    cv=RepeatedStratifiedKFold(cfg.outer_folds,cfg.repeats,random_state=cfg.seed); allrows=[]
+    cv=RepeatedStratifiedKFold(n_splits=cfg.outer_folds,n_repeats=cfg.repeats,random_state=cfg.seed); allrows=[]
     for k,(tr,te) in enumerate(cv.split(X,y)):
         rep=k//cfg.outer_folds+1; fold=k%cfg.outer_folds+1; cp=out/f'fold_predictions_repeat{rep}_fold{fold}.csv'; print(f'\n===== REPEAT {rep}/{cfg.repeats}, OUTER FOLD {fold}/{cfg.outer_folds} =====')
         if cp.exists():
